@@ -61,7 +61,9 @@ class Encoder:
         learning_rate: float,
     ) -> jnp.array:
         input_col_dim = parameters.shape[1]
-        hidden = jnp.zeros_like(input_activations)
+        hidden = compressed_to_full(
+            jnp.zeros_like(input_activations), dim=input_col_dim
+        )
         recons = jnp.zeros_like(input_activations)
 
         for i in range(num_iters):

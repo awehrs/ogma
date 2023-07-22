@@ -32,8 +32,8 @@ def stride_inputs(inputs: jnp.array, input_mapping: jnp.array) -> jnp.array:
 
 def compressed_to_full(idx: int, dim: int):
     """Construct one hot vector from the activation index."""
-    matrix = jnp.zeros(shape=(dim, len(idx)))
-    return matrix.at[idx, jnp.arange(dim)].set(1)
+    matrix = jnp.zeros(shape=(len(idx), dim))
+    return matrix.at[jnp.arange(len(idx)), idx].set(1)
 
 
 def get_clock_schedule(clock_type: str) -> Callable:

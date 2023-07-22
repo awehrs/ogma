@@ -2,10 +2,10 @@ num_layers: 4
 hidden_column_dim: 16
 preprocessor_dim: 16
 share_weights: false
-x_dim: 16 # Max sequence length
+x_dim: 32 # Max sequence length
 y_dim:
 encoder_lr: 0.5
-num_iters: 20
+num_iters: 3
 decoder_lr: 0.5
 up_radius: 2
 down_radius: 2
