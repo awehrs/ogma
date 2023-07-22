@@ -1,0 +1,16 @@
+num_layers: 4
+hidden_column_dim: 16
+preprocessor_dim: 16
+share_weights: false
+x_dim: 16 # Max sequence length
+y_dim:
+encoder_lr: 0.5
+num_iters: 20
+decoder_lr: 0.5
+up_radius: 2
+down_radius: 2
+pad: false
+pad_value: "-inf"
+rng_seed: 42
+clock_type: "exponential"
+temporal_horizon: 2

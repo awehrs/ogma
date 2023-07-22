@@ -1,0 +1,14 @@
+setup.py
+src/__init__.py
+src/actor.py
+src/decoder.py
+src/encoder.py
+src/main.py
+src/network.py
+src/preprocessor.py
+src/propagate.py
+src/utils.py
+src.egg-info/PKG-INFO
+src.egg-info/SOURCES.txt
+src.egg-info/dependency_links.txt
+src.egg-info/top_level.txt
