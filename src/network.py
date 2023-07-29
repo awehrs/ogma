@@ -46,7 +46,7 @@ class MemoryBuffer:
 
     def all(self, enc_or_dec: str) -> jnp.array:
         """Get all activations; shape = (temporal_horizon, num_hidden_columns[, column_dim])"""
-        return jnp.stack(self.buffer[enc_or_dec], axis=0)
+        return jnp.concatenate(self.buffer[enc_or_dec], axis=0)
 
     def push(self, activation: jnp.array, enc_or_dec: str) -> None:
         if enc_or_dec == "encoder":
@@ -72,6 +72,8 @@ class Layer:
 
 
 class Network:
+    """Sparse Predictive Heirarchy"""
+
     def __init__(
         self,
         layers: List[Layer],
@@ -87,27 +89,26 @@ class Network:
             layer = self.layers[l]
             if l == 0:
                 # No history for bottom layer.
-                inputs = stride_inputs(precepts, layer.upward_mapping)
                 h_t = layer.enc(
-                    inputs,
+                    precepts,
                     learn=learn,
                     upward_mapping=layer.upward_mapping,
                     downward_mapping=layer.downward_mapping,
                 )
+                layer.updated = True
             elif layer.ticks >= layer.ticks_per_update:
                 layer.ticks = 0
                 layer.updated = True
                 histories = layer.history.all("encoder")
-                inputs = stride_inputs(histories, layer.upward_mapping)
                 h_t = layer.enc(
-                    inputs,
+                    histories,
                     learn=learn,
                     upward_mapping=layer.upward_mapping,
                     downward_mapping=layer.downward_mapping,
                 )
             layer.history.push(h_t, "encoder")
             if l < len(self.layers) - 1:
-                self.layer[l + 1].ticks += 1
+                self.layers[l + 1].ticks += 1
 
         # Downward pass.
         for l in reversed(range(len(self.layers))):
@@ -115,20 +116,23 @@ class Network:
             if layer.updated:
                 if l == len(self.layers) - 1:
                     # Use last hidden state local produced in encoder loop.
-                    inputs = stride_inputs(h_t, layer.downward_mapping)
+                    inputs = h_t
                 else:
                     enc_output = layer.history.nearest("encoder")
                     dec_output = self.layers[1 + 1].history.nearest("decoder")
-                    feedback = layer.dec.activate(dec_output)
-                    inputs = stride_inputs(
-                        jnp.stack([enc_output, feedback], axis=0),
-                        layer.downward_mapping,
-                    )
-                y_t = layer.dec(inputs, prev_predictions=dec_output, learn=learn)
+                    feedback = jnp.argmax(dec_output, axis=1)
+                    inputs = jnp.concatenate([enc_output, feedback], axis=0)
+                y_t = layer.dec(
+                    inputs,
+                    prev_prediction=dec_output,
+                    downward_mapping=layer.downward_mapping,
+                    learn=learn,
+                )
                 if l > 0:
                     layer.push("decoder", y_t)
                 else:
-                    layer.actor()
+                    pass
+                    # layer.actor()
                 layer.updated = False
         return y_t
 

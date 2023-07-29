@@ -36,7 +36,7 @@ def propagate(
     return output
 
 
-# @partial(jit, static_argnums=(1,))
+@partial(jit, static_argnums=(1,))
 def sparse_matmul(
     parameters: jnp.array,
     input_activations: jnp.array,
