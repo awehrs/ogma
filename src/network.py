@@ -121,9 +121,9 @@ class Network:
                     enc_output = layer.history.nearest("encoder")
                     dec_output = self.layers[1 + 1].history.nearest("decoder")
                     feedback = jnp.argmax(dec_output, axis=1)
-                    inputs = jnp.concatenate([enc_output, feedback], axis=0)
                 y_t = layer.dec(
-                    inputs,
+                    feedforward=enc_output,
+                    feedback=feedback,
                     prev_prediction=dec_output,
                     downward_mapping=layer.downward_mapping,
                     learn=learn,

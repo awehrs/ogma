@@ -1,5 +1,5 @@
 from src.propagate import propagate
-from utils import stride_inputs
+from utils import compressed_to_full, stride_inputs
 
 from typing import Any, Tuple
 
@@ -40,7 +40,8 @@ class Decoder:
 
     def step(
         self,
-        inputs: jnp.array,
+        feedforward: jnp.array,
+        feedback: jnp.array,
         prev_prediction: jnp.array,
         parameters: jnp.array,
         downward_mapping: jnp.array,
@@ -48,20 +49,28 @@ class Decoder:
         learn: bool = True,
     ) -> Tuple[jnp.array]:
         if learn:
-            parameters = self.learn(inputs, prev_prediction, parameters, learning_rate)
-        y = self.forward(inputs, parameters)
-        y_t_2n, y_t_4n = jnp.split(y, indices_or_sections=2, axis=0)
-        return y_t_2n, y_t_4n
+            parameters = self.learn(
+                inputs=compressed_to_full(feedforward, dim=prev_prediction.shape[-1]),
+                prev_prediction=prev_prediction,
+                parameters=parameters,
+                learning_rate=learning_rate,
+            )
+        inputs = stride_inputs(
+            jnp.concatenate([feedforward, feedback], axis=0), downward_mapping
+        )
+        return self.forward(inputs, parameters)
 
     def __call__(
         self,
-        inputs: jnp.array,
+        feedforward: jnp.array,
+        feedback: jnp.array,
         prev_prediction: jnp.array,
         downward_mapping: jnp.array,
         learn: bool,
     ) -> Any:
         return self.step(
-            inputs=inputs,
+            feedforward=feedforward,
+            feedback=feedback,
             prev_prediction=prev_prediction,
             parameters=self.parameters,
             downward_mapping=downward_mapping,
