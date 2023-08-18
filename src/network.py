@@ -134,17 +134,15 @@ class Network:
         for l in reversed(range(len(self.layers))):
             layer = self.layers[l]
             if layer.updated:
-                if l == len(self.layers) - 1:
-                    # Use last hidden state local produced in encoder loop.
-                    same_layer_enc_output = h_t
-                else:
-                    same_layer_enc_output = layer.buffer.nearest("encoder")
-                    next_layer_dec_output = self.layers[1 + 1].buffer.nearest("decoder")
-                    next_layer_dec_output = jnp.argmax(next_layer_dec_output, axis=1)
-
+                same_layer_enc_output = layer.buffer.nearest("encoder")
+                next_layer_dec_output = (
+                    self.layers[1 + 1].buffer.nearest("decoder")
+                    if l < len(self.layers)
+                    else None
+                )
                 y_t = layer.dec(
-                    same_layer_enc_output=same_layer_enc_output,
-                    next_layer_dec_output=next_layer_dec_output,
+                    ctx_encoder=same_layer_enc_output,
+                    ctx_decoder=next_layer_dec_output,
                     downward_mapping=self.downward_mapping,
                     learn=False,
                 )
