@@ -1,11 +1,10 @@
 from src.actor import Actor
 from src.encoder import Encoder
 from src.decoder import Decoder
-from src.utils import stride_inputs
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, List, Mapping
+from typing import List, Mapping
 
 from einops import rearrange
 import jax.numpy as jnp
@@ -26,23 +25,25 @@ class MemoryBuffer:
         self.temporal_horizon = temporal_horizon
         enc_buffer = deque(
             [jnp.zeros(shape=(num_input_columns,)) for _ in range(temporal_horizon)],
-            maxlen=temporal_horizon,
+            maxlen=max(temporal_horizon, 1)
+            # Bottom layer needs to be able to access current encoder activation.
         )
         dec_buffer = deque(
             [
                 jnp.zeros(shape=(num_input_columns, input_dim))
                 for _ in range(temporal_horizon)
             ],
-            maxlen=temporal_horizon,
+            maxlen=temporal_horizon + 1,
+            # Need extra step of memory for decoder learning.
         )
         self.buffer = {"encoder": enc_buffer, "decoder": dec_buffer}
 
     def nearest(self, enc_or_dec: str) -> jnp.array:
         """Get closest activation in time; shape = (num_hidden_columns[, column_dim])"""
         if enc_or_dec == "encoder":
-            return self.buffer[enc_or_dec].pop()
+            return self.buffer[enc_or_dec][-1]
         else:
-            return self.buffer[enc_or_dec].popleft()
+            return self.buffer[enc_or_dec][0]
 
     def all(self, enc_or_dec: str) -> jnp.array:
         """Get all activations; shape = (temporal_horizon, num_hidden_columns[, column_dim])"""
@@ -63,9 +64,7 @@ class Layer:
     temporal_horizon: int
     dec: Decoder
     enc: Encoder
-    history: MemoryBuffer
-    upward_mapping: jnp.array
-    downward_mapping: jnp.array
+    buffer: MemoryBuffer
     ticks_per_update: int
     ticks: int = 0
     updated: bool = False
@@ -78,35 +77,56 @@ class Network:
         self,
         layers: List[Layer],
         config: Mapping,
+        upward_mapping: jnp.array,
+        downward_mapping: jnp.array,
     ):
         self.layers = layers
         self.config = config
+        self.upward_mapping = upward_mapping
+        self.downward_mapping = downward_mapping
 
     def step(self, precepts: jnp.array, learn: bool = True, act: bool = False):
         """Perform upward (encoder) and downward (decoder) pass."""
         # Upward pass.
         for l in range(len(self.layers)):
             layer = self.layers[l]
-            if l == 0:
-                # No history for bottom layer.
-                h_t = layer.enc(
-                    precepts,
-                    learn=learn,
-                    upward_mapping=layer.upward_mapping,
-                    downward_mapping=layer.downward_mapping,
+
+            if l != 0 or layer.ticks < layer.ticks:
+                continue
+
+            # Encoder pass.
+            inputs = precepts if l == 0 else layer.buffer.all("encoder")
+            layer.ticks = 0
+            layer.updated = True
+            h_t = layer.enc(
+                input_activations=inputs,
+                learn=learn,
+                upward_mapping=self.upward_mapping,
+                downward_mapping=self.downward_mapping,
+            )
+
+            # Update the weights of the next layer's decoder.
+            if learn and l < len(self.layers):
+                _layer = self.layers[l + 1]
+                # Encoder output prediction was based on.
+                same_layer_enc_output = _layer.buffer.nearest("encoder")
+                # Decoder output prediction was based on.
+                next_layer_dec_output = (
+                    self.layers[l + 2].buffer.nearest("decoder")
+                    if l <= len(self.layers) - 2
+                    else None
                 )
-                layer.updated = True
-            elif layer.ticks >= layer.ticks_per_update:
-                layer.ticks = 0
-                layer.updated = True
-                histories = layer.history.all("encoder")
-                h_t = layer.enc(
-                    histories,
-                    learn=learn,
-                    upward_mapping=layer.upward_mapping,
-                    downward_mapping=layer.downward_mapping,
+                _layer.decoder(
+                    curr_target=h_t,
+                    prev_prediction=_layer.buffer.nearest("decoder"),
+                    ctx_encoder=same_layer_enc_output,
+                    ctx_decoder=next_layer_dec_output,
+                    downward_mapping=self.downward_mapping,
                 )
-            layer.history.push(h_t, "encoder")
+
+            # Update encoder state after decoder learning,
+            #  so that downward pass pops correct encoder output.
+            layer.buffer.push(h_t, "encoder")
             if l < len(self.layers) - 1:
                 self.layers[l + 1].ticks += 1
 
@@ -116,23 +136,19 @@ class Network:
             if layer.updated:
                 if l == len(self.layers) - 1:
                     # Use last hidden state local produced in encoder loop.
-                    inputs = h_t
+                    same_layer_enc_output = h_t
                 else:
-                    enc_output = layer.history.nearest("encoder")
-                    dec_output = self.layers[1 + 1].history.nearest("decoder")
-                    feedback = jnp.argmax(dec_output, axis=1)
+                    same_layer_enc_output = layer.buffer.nearest("encoder")
+                    next_layer_dec_output = self.layers[1 + 1].buffer.nearest("decoder")
+                    next_layer_dec_output = jnp.argmax(next_layer_dec_output, axis=1)
+
                 y_t = layer.dec(
-                    feedforward=enc_output,
-                    feedback=feedback,
-                    prev_prediction=dec_output,
-                    downward_mapping=layer.downward_mapping,
-                    learn=learn,
+                    same_layer_enc_output=same_layer_enc_output,
+                    next_layer_dec_output=next_layer_dec_output,
+                    downward_mapping=self.downward_mapping,
+                    learn=False,
                 )
-                if l > 0:
-                    layer.push("decoder", y_t)
-                else:
-                    pass
-                    # layer.actor()
+                layer.push("decoder", y_t)
                 layer.updated = False
         return y_t
 
@@ -261,15 +277,18 @@ class Network:
                 Layer(
                     dec=dec,
                     enc=enc,
-                    history=buf,
+                    buffer=buf,
                     temporal_horizon=config.temporal_horizon,
-                    upward_mapping=up_mapping,
-                    downward_mapping=down_mapping,
                     ticks=0,
                     ticks_per_update=2**l,  # Exponential memory.
                 )
             )
-        return cls(layers=layers, config=config)
+        return cls(
+            layers=layers,
+            config=config,
+            upward_mapping=up_mapping,
+            downward_mapping=down_mapping,
+        )
 
     @classmethod
     def build_connection_mapping_1d(

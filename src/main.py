@@ -15,8 +15,8 @@ config = OmegaConf.load(Path("src", "config") / "text.yaml")
 network = Network.init_random(config)
 
 layer = network.layers[0]
-upward_mapping = layer.upward_mapping
-downward_mapping = layer.downward_mapping
+upward_mapping = network.upward_mapping
+downward_mapping = network.downward_mapping
 
 encoder = layer.enc
 decoder = layer.dec

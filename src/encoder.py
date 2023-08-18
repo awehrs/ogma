@@ -61,21 +61,21 @@ class Encoder:
         learning_rate: float,
     ) -> jnp.array:
         input_col_dim = parameters.shape[1]
-        hidden = compressed_to_full(
+        activation = compressed_to_full(
             jnp.zeros_like(input_activations), dim=input_col_dim
         )
         recons = jnp.zeros_like(input_activations)
 
         for i in range(num_iters):
             inputs = stride_inputs(input_activations - recons, upward_mapping)
-            hidden += self.forward(
+            activation += self.forward(
                 inputs,
                 parameters,
                 input_is_one_hot=(i < 1),
                 output_is_one_hot=False,
             )
             recons = self.backward(
-                jnp.argmax(hidden, axis=1),
+                jnp.argmax(activation, axis=1),
                 parameters,
                 downward_mapping,
                 output_is_one_hot=False,
@@ -89,7 +89,7 @@ class Encoder:
 
         loss = stride_inputs(loss, upward_mapping)
 
-        hidden = jnp.argmax(hidden, axis=1)
+        hidden = jnp.argmax(activation, axis=1)
 
         hidden = compressed_to_full(hidden, dim=input_col_dim)
 
@@ -99,12 +99,8 @@ class Encoder:
 
         return parameters
 
-    def loss(self, input_column: jnp.array, recons_column: jnp.array) -> jnp.array:
-        """
-        Calculate reconstruction loss of a single input column. Isolated here
-            to allow vmap'ing.
-        """
-        return input_column - recons_column
+    def loss(self, inputs: jnp.array, reconstruction: jnp.array) -> jnp.array:
+        return inputs - reconstruction
 
     def update(
         self,
@@ -149,6 +145,7 @@ class Encoder:
 
     def __call__(
         self,
+        *,
         input_activations: jnp.array,
         learn: bool,
         upward_mapping: jnp.array,

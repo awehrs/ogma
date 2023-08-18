@@ -17,7 +17,7 @@ def moving_window(x: jnp.array, size: int):
 def stride_inputs(inputs: jnp.array, input_mapping: jnp.array) -> jnp.array:
     """
     Args:
-        inputs: array of shape ([temporal_horiozn,], n_input_columns, [input_column_dim]),
+        inputs: array of shape ([temporal_horizon,], n_input_columns, [input_column_dim]),
         depending on whether input is sparse or not
     Returns array of size (n_hidden_cols, receptive_area, [input_column_dim]),
         depending on whether input is sparse.
