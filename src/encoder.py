@@ -115,7 +115,7 @@ class Encoder:
         Returns:
             array of shape (receptive_area, hidden_dim, input_dim)
         """
-        return jnp.kron(jnp.transpose(input_losses), hidden_column)
+        return jnp.kron(input_losses, jnp.transpose(hidden_column))
 
     def step(
         self,

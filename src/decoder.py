@@ -1,8 +1,9 @@
 from src.propagate import propagate
-from utils import compressed_to_full, stride_inputs
+from src.utils import compressed_to_full, stride_inputs
 
 from typing import Any, Optional, Tuple
 
+from einops import rearrange
 from jax import nn, vmap
 import jax.numpy as jnp
 
@@ -24,8 +25,7 @@ class Decoder:
         return nn.softmax(h)
 
     def loss(self, prediction: jnp.array, target: jnp.array):
-        """Cross-entropy loss."""
-        return -jnp.sum(target * jnp.log(prediction))
+        return target - prediction
 
     def update(
         self,
@@ -47,19 +47,23 @@ class Decoder:
         target: jnp.array,
         prediction: jnp.array,
         prev_context: jnp.array,
+        parameters: jnp.array,
         downward_mapping: jnp.array,
+        learning_rate: float,
     ) -> jnp.array:
         loss = self.loss(prediction, target)
         loss = stride_inputs(loss, downward_mapping)
 
-        delta = vmap(self.update(loss, prev_context))
+        delta = vmap(self.update)(loss, prev_context)
 
-        self.parameters += self.lr * delta
+        parameters += learning_rate * delta
+
+        return parameters
 
     def step(
         self,
         ctx_encoder: jnp.array,
-        ctx_decoder: jnp.array,
+        ctx_decoder: Optional[jnp.array],
         prev_prediction: jnp.array,
         curr_target: jnp.array,
         parameters: jnp.array,
@@ -70,9 +74,16 @@ class Decoder:
         if learn:
             assert (prev_prediction is not None) and (curr_target is not None)
             ctx_encoder = compressed_to_full(ctx_encoder, dim=prev_prediction.shape[-1])
-            ctx_decoder = compressed_to_full(ctx_decoder, dim=prev_prediction.shape[-1])
-            prev_context = jnp.concatenate(ctx_encoder, ctx_decoder, axis=0)
-            parameters = self.learn(
+            if ctx_decoder is not None:  # E.g., this isn't the top layer.
+                # Shape = [num_columns, 2 * col_dimension]:
+                prev_context = jnp.concatenate([ctx_decoder, ctx_encoder], axis=1)
+                # Shape = [num_columns, receptive_area, 2 * column_dimension]:
+                prev_context = stride_inputs(prev_context, downward_mapping)
+                # Shape = [num_columns, recepetive_area * 2, column_dimension]:
+                prev_context = rearrange(
+                    prev_context, "n r (x d) -> n (r x) d", d=prev_prediction.shape[-1]
+                )
+            self.parameters = self.learn(
                 target=compressed_to_full(curr_target, dim=prev_prediction.shape[-1]),
                 prediction=prev_prediction,
                 prev_context=prev_context,
@@ -81,8 +92,18 @@ class Decoder:
                 learning_rate=learning_rate,
             )
         else:
-            ctx_decoder = self.activate(ctx_decoder)
-            context = jnp.concatenate(ctx_encoder, ctx_decoder, axis=0)
+            if ctx_decoder is not None:  # E.g, this isn't the top layer.
+                ctx_decoder = self.activate(ctx_decoder)
+                # Shape = [num_columns, 2]:
+                context = jnp.stack([ctx_decoder, ctx_encoder], axis=1)
+                # Shape = [num_columns, recepetive_area, 2]:
+                context = stride_inputs(context, downward_mapping)
+                # Shape = [num_columns, receptive_area * 2]:
+                context = rearrange(context, "n r d -> n (r d)")
+            else:
+                # Shape = [num_columns, receptive_area]
+                context = stride_inputs(ctx_encoder, downward_mapping)
+
             return self.forward(context, parameters)
 
     def __call__(

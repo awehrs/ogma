@@ -18,8 +18,8 @@ layer = network.layers[0]
 upward_mapping = network.upward_mapping
 downward_mapping = network.downward_mapping
 
-encoder = layer.enc
-decoder = layer.dec
+encoder = layer.encoder
+decoder = layer.decoder
 
 key = random.PRNGKey(config.rng_seed)
 

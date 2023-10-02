@@ -24,13 +24,16 @@ class MemoryBuffer:
     ):
         self.temporal_horizon = temporal_horizon
         enc_buffer = deque(
-            [jnp.zeros(shape=(num_input_columns,)) for _ in range(temporal_horizon)],
+            [
+                jnp.zeros(shape=(num_input_columns,), dtype="int16")
+                for _ in range(temporal_horizon)
+            ],
             maxlen=max(temporal_horizon, 1)
             # Bottom layer needs to be able to access current encoder activation.
         )
         dec_buffer = deque(
             [
-                jnp.zeros(shape=(num_input_columns, input_dim))
+                jnp.zeros(shape=(num_input_columns, input_dim), dtype="int16")
                 for _ in range(temporal_horizon)
             ],
             maxlen=temporal_horizon + 1,
@@ -45,7 +48,7 @@ class MemoryBuffer:
         else:
             return self.buffer[enc_or_dec][0]
 
-    def all(self, enc_or_dec: str) -> jnp.array:
+    def _all(self, enc_or_dec: str) -> jnp.array:
         """Get all activations; shape = (temporal_horizon, num_hidden_columns[, column_dim])"""
         return jnp.concatenate(self.buffer[enc_or_dec], axis=0)
 
@@ -62,8 +65,8 @@ class MemoryBuffer:
 @dataclass
 class Layer:
     temporal_horizon: int
-    dec: Decoder
-    enc: Encoder
+    decoder: Decoder
+    encoder: Encoder
     buffer: MemoryBuffer
     ticks_per_update: int
     ticks: int = 0
@@ -91,37 +94,38 @@ class Network:
         for l in range(len(self.layers)):
             layer = self.layers[l]
 
-            if l != 0 or layer.ticks < layer.ticks:
+            if (l != 0) and (layer.ticks < layer.ticks_per_update):
+                # Not ready to fire.
                 continue
 
             # Encoder pass.
-            inputs = precepts if l == 0 else layer.buffer.all("encoder")
+            inputs = precepts if l == 0 else layer.buffer._all("encoder")
             layer.ticks = 0
             layer.updated = True
-            h_t = layer.enc(
+            h_t = layer.encoder(
                 input_activations=inputs,
                 learn=learn,
                 upward_mapping=self.upward_mapping,
                 downward_mapping=self.downward_mapping,
             )
 
-            # Update the weights of the next layer's decoder.
-            if learn and l < len(self.layers):
-                _layer = self.layers[l + 1]
+            # Update the weights of this layer's decoder.
+            if learn:
                 # Encoder output prediction was based on.
-                same_layer_enc_output = _layer.buffer.nearest("encoder")
+                prev_enc_output = layer.buffer.nearest("encoder")
                 # Decoder output prediction was based on.
                 next_layer_dec_output = (
                     self.layers[l + 2].buffer.nearest("decoder")
-                    if l <= len(self.layers) - 2
+                    if l <= len(self.layers) - 1
                     else None
                 )
-                _layer.decoder(
+                layer.decoder(
                     curr_target=h_t,
-                    prev_prediction=_layer.buffer.nearest("decoder"),
-                    ctx_encoder=same_layer_enc_output,
+                    prev_prediction=layer.buffer.nearest("decoder"),
+                    ctx_encoder=prev_enc_output,
                     ctx_decoder=next_layer_dec_output,
                     downward_mapping=self.downward_mapping,
+                    learn=True,
                 )
 
             # Update encoder state after decoder learning,
@@ -228,7 +232,7 @@ class Network:
                         config.temporal_horizon * receptive_area_up * col_dim,
                     ),
                 )
-                # But no feeback (or memory buffer)
+                # But no feeback (or memory buffer).
                 key, subkey = random.split(key)
                 dec_params = random.normal(
                     subkey,
@@ -273,8 +277,8 @@ class Network:
             dec = Decoder(parameters=dec_params, learning_rate=config.decoder_lr)
             layers.append(
                 Layer(
-                    dec=dec,
-                    enc=enc,
+                    decoder=dec,
+                    encoder=enc,
                     buffer=buf,
                     temporal_horizon=config.temporal_horizon,
                     ticks=0,
