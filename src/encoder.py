@@ -87,11 +87,13 @@ class Encoder:
 
         loss = self.loss(input_activations, recons)
 
-        loss = stride_inputs(loss, upward_mapping)
-
         hidden = jnp.argmax(activation, axis=1)
 
         hidden = compressed_to_full(hidden, dim=input_col_dim)
+
+        hidden = stride_inputs(hidden, downward_mapping)
+
+        hidden = rearrange(hidden, "n r h -> n (r h)")
 
         delta = vmap(self.update)(loss, hidden)
 
@@ -109,12 +111,14 @@ class Encoder:
     ) -> jnp.array:
         """
         Args:
-            input_losses: array of shape (receptive_area, input_dim)
-            hidden_column: array of shape (hidden_dim,)
+            input_losses: array of shape (input_dim)
+            hidden_column: array of shape (hidden_dim * receptive_area,)
 
         Returns:
             array of shape (receptive_area, hidden_dim, input_dim)
         """
+        input_losses = jnp.expand_dims(input_losses, axis=1)
+        hidden_column = jnp.expand_dims(hidden_column, axis=1)
         return jnp.kron(input_losses, jnp.transpose(hidden_column))
 
     def step(

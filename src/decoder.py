@@ -40,7 +40,9 @@ class Decoder:
         Returns:
             array of shape (receptive_area, prediction_dim, context_dim)
         """
-        return jnp.kron(jnp.transpose(input_losses), previous_context)
+        input_losses = jnp.expand_dims(input_losses, axis=1)
+        previous_context = jnp.expand_dims(previous_context, axis=1)
+        return jnp.kron(input_losses, jnp.transpose(previous_context))
 
     def learn(
         self,
@@ -50,13 +52,19 @@ class Decoder:
         parameters: jnp.array,
         downward_mapping: jnp.array,
         learning_rate: float,
+        offset: int,
     ) -> jnp.array:
         loss = self.loss(prediction, target)
-        loss = stride_inputs(loss, downward_mapping)
+
+        prev_context = rearrange(prev_context, "n r h -> n (r h)")
 
         delta = vmap(self.update)(loss, prev_context)
-
-        parameters += learning_rate * delta
+        input_dim = prediction.shape[-1]
+        parameters = parameters.at[
+            :,
+            offset * input_dim : (offset + 1) * input_dim,
+            :,
+        ].set(learning_rate * delta)
 
         return parameters
 
@@ -69,7 +77,8 @@ class Decoder:
         parameters: jnp.array,
         downward_mapping: jnp.array,
         learning_rate: float,
-        learn: bool = True,
+        offset: int,
+        learn: bool = False,
     ) -> Optional[Tuple[jnp.array]]:
         if learn:
             assert (prev_prediction is not None) and (curr_target is not None)
@@ -83,6 +92,8 @@ class Decoder:
                 prev_context = rearrange(
                     prev_context, "n r (x d) -> n (r x) d", d=prev_prediction.shape[-1]
                 )
+            else:
+                prev_context = stride_inputs(ctx_encoder, downward_mapping)
             self.parameters = self.learn(
                 target=compressed_to_full(curr_target, dim=prev_prediction.shape[-1]),
                 prediction=prev_prediction,
@@ -90,6 +101,7 @@ class Decoder:
                 parameters=parameters,
                 downward_mapping=downward_mapping,
                 learning_rate=learning_rate,
+                offset=offset,
             )
         else:
             if ctx_decoder is not None:  # E.g, this isn't the top layer.
@@ -113,6 +125,7 @@ class Decoder:
         ctx_decoder,
         downward_mapping: jnp.array,
         learn: bool,
+        offset: int,
         prev_prediction: Optional[jnp.array] = None,
         curr_target: Optional[jnp.array] = None,
     ) -> Any:
@@ -124,5 +137,6 @@ class Decoder:
             parameters=self.parameters,
             downward_mapping=downward_mapping,
             learning_rate=self.lr,
+            offset=offset,
             learn=learn,
         )

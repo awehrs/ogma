@@ -119,12 +119,19 @@ class Network:
                     if l <= len(self.layers) - 1
                     else None
                 )
+                # Determine whether this was decoder's long or near term prediction.
+                offset = (
+                    1
+                    if self.layers[l + 1].ticks < self.layers[l + 1].ticks_per_update
+                    else 0
+                )
                 layer.decoder(
                     curr_target=h_t,
                     prev_prediction=layer.buffer.nearest("decoder"),
                     ctx_encoder=prev_enc_output,
                     ctx_decoder=next_layer_dec_output,
                     downward_mapping=self.downward_mapping,
+                    offset=offset,
                     learn=True,
                 )
 
@@ -144,13 +151,14 @@ class Network:
                     if l < len(self.layers)
                     else None
                 )
-                y_t = layer.dec(
+                y_t = layer.decoder(
                     ctx_encoder=same_layer_enc_output,
                     ctx_decoder=next_layer_dec_output,
                     downward_mapping=self.downward_mapping,
                     learn=False,
+                    offset=5,
                 )
-                layer.push("decoder", y_t)
+                layer.buffer.push("decoder", y_t)
                 layer.updated = False
         return y_t
 
