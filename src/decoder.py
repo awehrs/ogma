@@ -1,9 +1,7 @@
 from src.propagate import propagate
-from src.utils import compressed_to_full, stride_inputs
 
-from typing import Any, Optional, Tuple
+from typing import Tuple
 
-from einops import rearrange
 from jax import nn, vmap
 import jax.numpy as jnp
 
@@ -44,99 +42,53 @@ class Decoder:
         previous_context = jnp.expand_dims(previous_context, axis=1)
         return jnp.kron(input_losses, jnp.transpose(previous_context))
 
+    def _learn(
+        self,
+        target: jnp.array,
+        prediction: jnp.array,
+        context: jnp.array,
+        parameters: jnp.array,
+        learning_rate: float,
+    ) -> Tuple[jnp.array]:
+        loss = self.loss(prediction, target)
+
+        delta = vmap(self.update)(loss, context)
+
+        parameters += learning_rate * delta
+
+        return loss, parameters
+
     def learn(
         self,
         target: jnp.array,
         prediction: jnp.array,
-        prev_context: jnp.array,
+        context: jnp.array,
+    ):
+        """Outter learn function."""
+        loss, parameters = self._learn(
+            target=target,
+            prediction=prediction,
+            context=context,
+            parameters=self.parameters,
+            learning_rate=self.lr,
+        )
+
+        self.parameters = parameters
+
+        return loss, parameters
+
+    def _step(
+        self,
+        context: jnp.array,
         parameters: jnp.array,
-        downward_mapping: jnp.array,
-        learning_rate: float,
-        offset: int,
-    ) -> jnp.array:
-        loss = self.loss(prediction, target)
-
-        prev_context = rearrange(prev_context, "n r h -> n (r h)")
-
-        delta = vmap(self.update)(loss, prev_context)
-        input_dim = prediction.shape[-1]
-        parameters = parameters.at[
-            :,
-            offset * input_dim : (offset + 1) * input_dim,
-            :,
-        ].set(learning_rate * delta)
-
-        return parameters
+    ) -> Tuple[jnp.array]:
+        return self.forward(context, parameters)
 
     def step(
         self,
-        ctx_encoder: jnp.array,
-        ctx_decoder: Optional[jnp.array],
-        prev_prediction: jnp.array,
-        curr_target: jnp.array,
-        parameters: jnp.array,
-        downward_mapping: jnp.array,
-        learning_rate: float,
-        offset: int,
-        learn: bool = False,
-    ) -> Optional[Tuple[jnp.array]]:
-        if learn:
-            assert (prev_prediction is not None) and (curr_target is not None)
-            ctx_encoder = compressed_to_full(ctx_encoder, dim=prev_prediction.shape[-1])
-            if ctx_decoder is not None:  # E.g., this isn't the top layer.
-                # Shape = [num_columns, 2 * col_dimension]:
-                prev_context = jnp.concatenate([ctx_decoder, ctx_encoder], axis=1)
-                # Shape = [num_columns, receptive_area, 2 * column_dimension]:
-                prev_context = stride_inputs(prev_context, downward_mapping)
-                # Shape = [num_columns, recepetive_area * 2, column_dimension]:
-                prev_context = rearrange(
-                    prev_context, "n r (x d) -> n (r x) d", d=prev_prediction.shape[-1]
-                )
-            else:
-                prev_context = stride_inputs(ctx_encoder, downward_mapping)
-            self.parameters = self.learn(
-                target=compressed_to_full(curr_target, dim=prev_prediction.shape[-1]),
-                prediction=prev_prediction,
-                prev_context=prev_context,
-                parameters=parameters,
-                downward_mapping=downward_mapping,
-                learning_rate=learning_rate,
-                offset=offset,
-            )
-        else:
-            if ctx_decoder is not None:  # E.g, this isn't the top layer.
-                ctx_decoder = self.activate(ctx_decoder)
-                # Shape = [num_columns, 2]:
-                context = jnp.stack([ctx_decoder, ctx_encoder], axis=1)
-                # Shape = [num_columns, recepetive_area, 2]:
-                context = stride_inputs(context, downward_mapping)
-                # Shape = [num_columns, receptive_area * 2]:
-                context = rearrange(context, "n r d -> n (r d)")
-            else:
-                # Shape = [num_columns, receptive_area]
-                context = stride_inputs(ctx_encoder, downward_mapping)
-
-            return self.forward(context, parameters)
-
-    def __call__(
-        self,
-        *,
-        ctx_encoder,
-        ctx_decoder,
-        downward_mapping: jnp.array,
-        learn: bool,
-        offset: int,
-        prev_prediction: Optional[jnp.array] = None,
-        curr_target: Optional[jnp.array] = None,
-    ) -> Any:
-        return self.step(
-            ctx_encoder=ctx_encoder,
-            ctx_decoder=ctx_decoder,
-            prev_prediction=prev_prediction,
-            curr_target=curr_target,
+        context: jnp.array,
+    ) -> Tuple[jnp.array]:
+        return self._step(
+            context=context,
             parameters=self.parameters,
-            downward_mapping=downward_mapping,
-            learning_rate=self.lr,
-            offset=offset,
-            learn=learn,
         )

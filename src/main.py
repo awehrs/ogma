@@ -1,11 +1,10 @@
 from src.encoder import Encoder
 from src.decoder import Decoder
 from src.network import Network
-from src.utils import stride_inputs
 
 from pathlib import Path
+import time
 
-import jax
 import jax.numpy as jnp
 from jax import random
 from omegaconf import OmegaConf
@@ -27,4 +26,9 @@ x_t = random.randint(
     key, shape=(config.x_dim,), minval=0, maxval=config.preprocessor_dim
 )
 
+print(network.num_params)
+
+t1 = time.time()
 network.step(x_t)
+t2 = time.time()
+print(t2 - t1)

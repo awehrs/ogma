@@ -61,9 +61,8 @@ class Encoder:
         learning_rate: float,
     ) -> jnp.array:
         input_col_dim = parameters.shape[1]
-        activation = compressed_to_full(
-            jnp.zeros_like(input_activations), dim=input_col_dim
-        )
+
+        activation = jnp.zeros(shape=(downward_mapping.shape[0], parameters.shape[1]))
         recons = jnp.zeros_like(input_activations)
 
         for i in range(num_iters):
@@ -141,8 +140,8 @@ class Encoder:
                 learning_rate,
             )
         return self.forward(
-            stride_inputs(input_activations, upward_mapping),
-            parameters,
+            input_activiations=stride_inputs(input_activations, upward_mapping),
+            parameters=parameters,
             input_is_one_hot=True,
             output_is_one_hot=True,
         )
@@ -160,7 +159,7 @@ class Encoder:
             pass
 
         return self.step(
-            input_activations,
+            input_activations=input_activations,
             parameters=self.parameters,
             num_iters=self.num_iters,
             upward_mapping=upward_mapping,

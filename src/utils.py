@@ -1,7 +1,7 @@
 from functools import partial
 from typing import Callable
 
-from einops import rearrange, repeat
+from einops import rearrange
 import jax
 import jax.numpy as jnp
 from jax import jit, vmap
@@ -30,10 +30,17 @@ def stride_inputs(inputs: jnp.array, input_mapping: jnp.array) -> jnp.array:
         return inputs[input_mapping]
 
 
-def compressed_to_full(idx: int, dim: int):
+def compressed_to_full(idx: jnp.array, dim: int):
     """Construct one hot vector from the activation index."""
     matrix = jnp.zeros(shape=(len(idx), dim), dtype="int16")
     return matrix.at[jnp.arange(len(idx)), idx].set(1)
+
+
+def concat_and_stride(
+    arr_1: jnp.array, arr_2: jnp.array, mapping: jnp.array
+) -> jnp.array:
+    """Index align and stride to input arrays"""
+    pass
 
 
 def get_clock_schedule(clock_type: str) -> Callable:
