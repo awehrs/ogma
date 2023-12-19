@@ -30,7 +30,7 @@ def stride_inputs(inputs: jnp.array, input_mapping: jnp.array) -> jnp.array:
         return inputs[input_mapping]
 
 
-def compressed_to_full(idx: jnp.array, dim: int):
+def sparse_to_dense(idx: jnp.array, dim: int):
     """Construct one hot vector from the activation index."""
     matrix = jnp.zeros(shape=(len(idx), dim), dtype="int16")
     return matrix.at[jnp.arange(len(idx)), idx].set(1)

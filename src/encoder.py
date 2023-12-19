@@ -1,4 +1,4 @@
-from src.utils import compressed_to_full, stride_inputs
+from src.utils import sparse_to_dense, stride_inputs
 from src.propagate import propagate
 
 from typing import Tuple
@@ -80,7 +80,7 @@ class Encoder:
                 output_is_one_hot=False,
             )
             if i == 0:
-                input_activations = compressed_to_full(
+                input_activations = sparse_to_dense(
                     input_activations, dim=input_col_dim
                 )
 
@@ -88,7 +88,7 @@ class Encoder:
 
         hidden = jnp.argmax(activation, axis=1)
 
-        hidden = compressed_to_full(hidden, dim=input_col_dim)
+        hidden = sparse_to_dense(hidden, dim=input_col_dim)
 
         hidden = stride_inputs(hidden, downward_mapping)
 

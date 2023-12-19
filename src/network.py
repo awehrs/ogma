@@ -1,7 +1,7 @@
 from src.actor import Actor
 from src.encoder import Encoder
 from src.decoder import Decoder
-from src.utils import compressed_to_full, stride_inputs
+from src.utils import sparse_to_dense, stride_inputs
 
 from collections import deque
 from dataclasses import dataclass
@@ -60,6 +60,7 @@ class MemoryBuffer:
 
 @dataclass
 class Layer:
+    level: int
     temporal_horizon: int
     decoder: Decoder
     encoder: Encoder
@@ -86,86 +87,23 @@ class Network:
 
     def step(self, precepts: jnp.array, learn: bool = True, act: bool = False):
         """Perform upward (decoder-learning, encoder) and downward (decoder) pass."""
-        # Upward pass.
-        for l in range(len(self.layers)):
-            layer = self.layers[l]
 
-            if (l != 0) and (layer.ticks < layer.ticks_per_update):
-                # Not ready to fire.
+        # Upward pass.
+        for layer in self.layers:
+            if (layer.level != 0) and (layer.ticks < layer.ticks_per_update):
+                # Layer not ready to fire.
                 continue
 
-            if l == 0:
-                inputs = precepts
-            else:
-                inputs = self.layers[l - 1].buffer._all("encoder")
-                inputs = jnp.stack(inputs, axis=1)
-                # Shape = [num_columns, receptive_area * 2], that look like:
-                # [[inputs[0:r]_t-1 | inputs[0:r]_t], [inputs[r|2r]_t-1 | inputs[r|2r]_t], ...]
-                inputs = rearrange(inputs, "n (d r) -> (n r) d")
+            inputs = self.get_layer_inputs(layer=layer, precepts=precepts)
 
             # Update the weights of this layer's decoder.
             if learn:
-                # Encoder output prediction was based on.
-                prev_enc_output = layer.buffer.nearest("encoder")
-                prev_enc_output = compressed_to_full(
-                    prev_enc_output, dim=self.config.hidden_column_dim
-                )
-
-                # Other inputs.
-                if l == len(self.layers):  # Top layer.
-                    prev_feedback = None
-                    context = stride_inputs(prev_enc_output, self.downward_mapping)
-                    targets = compressed_to_full(
-                        precepts,
-                        dim=self.config.hidden_column_dim,
-                    )
-                else:
-                    # Determine where we are in time.
-                    offset = (
-                        0
-                        if self.layers[l + 1].ticks
-                        < self.layers[l + 1].ticks_per_update
-                        else 1
-                    )
-                    prev_feedback = self.layers[l + 1].buffer._all("decoder")[offset]
-                    # Shape = [num_columns, 2]:
-                    context = jnp.concatenate([prev_feedback, prev_enc_output], axis=-1)
-                    # Shape = [num_columns, recepetive_area, 2]:
-                    context = stride_inputs(context, self.downward_mapping)
-                    # Shape = [num_columns, receptive_area * 2], that look like:
-                    # [[enc_out[0:r] | dec_out[0:r]], [enc_out[r|2r] | dec_out[r|2r]], ...]
-                    context = rearrange(context, "n r d -> n (d r)")
-
-                if l == 0:
-                    targets = precepts
-                    targets = compressed_to_full(
-                        precepts,
-                        dim=self.config.preprocessor_dim,
-                    )
-                    prev_prediction = layer.buffer.nearest("decoder")
-                else:
-                    targets = layer.buffer._all("encoder")
-                    targets = compressed_to_full(
-                        targets, dim=self.config.hidden_column_dim
-                    )
-                    prev_prediction = layer.buffer._all("decoder")
-                    # Shape = [num_columns, 2 * column_dim]:
-                    prev_prediction = jnp.concatenate(
-                        [prev_prediction[1], prev_prediction[2]], axis=-1
-                    )
-                    prev_prediction = rearrange(
-                        prev_prediction, "n (x d) -> n x d", x=2
-                    )
-
-                layer.decoder.learn(
-                    target=targets,
-                    prediction=prev_prediction,
-                    context=context,
-                )
+                self.decoder_call(layer=layer, inputs=inputs, learn=True)
 
             # Encoder pass.
             layer.ticks = 0
             layer.updated = True
+
             h_t = layer.encoder(
                 input_activations=inputs,
                 learn=learn,
@@ -173,53 +111,157 @@ class Network:
                 downward_mapping=self.downward_mapping,
             )
 
-            # Update encoder state
+            # Update encoder state.
             layer.buffer.push(h_t, "encoder")
 
         # Downward pass.
-        for l in reversed(range(len(self.layers))):
-            layer = self.layers[l]
-            if layer.updated:
-                # Encoder output.
-                same_layer_enc_output = self.layers[l].buffer.nearest("encoder")
+        for layer in reversed(self.layers):
+            if not layer.updated:
+                # Layer not ready to activate.
+                continue
 
-                # Decoder feedback
-                if l == len(self.layers):
-                    # Shape = [num_columns, receptive_area]
-                    context = stride_inputs(
-                        same_layer_enc_output, self.downward_mapping
-                    )
-                else:
-                    next_layer_dec_feedback = self.layers[1 + 1].buffer._all("decoder")
-                    # Determine where we are in time.
-                    offset = (
-                        0
-                        if self.layers[l + 1].ticks
-                        < self.layers[l + 1].ticks_per_update
-                        else 1
-                    )
-                    next_layer_dec_feedback = layer.decoder.activate(
-                        next_layer_dec_feedback[offset]
-                    )
-                    # Shape = [num_columns, 2]:
-                    context = jnp.stack(
-                        [next_layer_dec_feedback, same_layer_enc_output], axis=1
-                    )
-                    # Shape = [num_columns, recepetive_area, 2]:
-                    context = stride_inputs(context, self.downward_mapping)
-                    # Shape = [num_columns, receptive_area * 2]:
-                    context = rearrange(context, "n r d -> n (d r)")
+            y_t = self.decoder_call(layer=layer, inputs=inputs, learn=False)
 
-                y_t = layer.decoder.step(context=context)
+            # Update decoder buffer.
+            layer.buffer.push(y_t, "decoder")
 
-                # Update decoder buffer.
-                layer.buffer.push("decoder", y_t)
-                # Replace nearest in encoder buffer.
-                layer.buffer.push(
-                    "encoder",
-                )
-                layer.updated = False
+            layer.updated = False
+
         return y_t
+
+    def decoder_call(self, layer: Layer, inputs: jnp.array, learn: bool) -> None:
+        """
+        Gather a layer's previous context and, possibly, prediction, and targets;
+            and pass them to decoder's learning or forward function.
+        """
+        # Get most recent output of layer's encoder.
+        enc_output = self.get_layer_output(layer=layer, learn=learn)
+
+        # Get feedback from next layer's decoder.
+        feedback = self.get_feedback(layer=layer, learn=learn)
+
+        # Build context the decoder conditioned its previous prediction on.
+        context = self.build_decoder_context(
+            layer=layer,
+            feedback=feedback,
+            enc_output=enc_output,
+        )
+
+        # Get the previous prediction of this layer's decoder.
+        prev_prediction = self.get_prev_prediction(layer) if learn else None
+
+        # Get the target of the prediction.
+        targets = self.get_targets(layer=layer, inputs=inputs) if learn else None
+
+        return layer.decoder(
+            context=context,
+            prediction=prev_prediction,
+            target=targets,
+        )
+
+    def get_offset(self, layer: Layer) -> int:
+        """
+        Convenience method. Determines if layer is firing at the same time as
+            the layer above it (offset = 1) or  in between the activations of
+            the layer above it (offset = 0).
+        """
+        offset = (
+            0
+            if self.layers[layer.level + 1].ticks
+            < self.layers[layer.level + 1].ticks_per_update
+            else 1
+        )
+        return offset
+
+    def get_layer_output(self, layer: Layer, learn: bool) -> jnp.array:
+        """Get layer's most recent encoder ouput."""
+        enc_output = layer.buffer.nearest("encoder")
+
+        if learn:
+            enc_output = sparse_to_dense(enc_output, dim=self.config.hidden_column_dim)
+
+        return enc_output
+
+    def get_layer_inputs(self, layer: Layer, precepts: jnp.array) -> jnp.array:
+        """Get the feedforward inputs to a given layer."""
+        if layer.level == 0:
+            # Bottom layer has no history.
+            inputs = precepts
+        else:
+            # Every other layer pulls from a memory buffer.
+            inputs = self.layers[layer.level - 1].buffer._all("encoder")
+            inputs = jnp.stack(inputs, axis=1)
+            # Shape = [num_columns, receptive_area * 2], that look like:
+            # [[inputs[0:r]_t-1 | inputs[0:r]_t], [inputs[r:2r]_t-1 | inputs[r:2r]_t], ...]
+            inputs = rearrange(inputs, "n (d r) -> (n r) d")
+
+        return inputs
+
+    def get_feedback(self, layer: Layer, learn: bool) -> jnp.array:
+        """Get the feedback from next layer's decoder."""
+        if layer.level == len(self.layers):
+            # Top layer receives no feedback.
+            feedback = None
+        else:
+            offset = self.get_offset(layer)
+            feedback = self.layers[layer.level + 1].buffer._all("decoder")[offset]
+            if not learn:
+                feedback = layer.decoder.activate(feedback)
+
+        return feedback
+
+    def build_decoder_context(
+        self, layer: Layer, feedback: jnp.array, enc_output: jnp.array
+    ) -> jnp.array:
+        """
+        Combine (same layer) encoder output with decoder feeback, to create
+            context for decoder to consume.
+        """
+        if layer.level == len(self.layers):
+            # Shape = [num_columns, receptive_area]
+            context = stride_inputs(enc_output, self.downward_mapping)
+        else:
+            if len(feedback.shape) == 2:  # Dense inputs.
+                # Shape = [num_columns, 2]:
+                context = jnp.concatenate([feedback, enc_output], axis=-1)
+            else:  # Sparse inputs
+                # Shape = [num_columns, 2]:
+                context = jnp.stack([feedback, enc_output], axis=1)
+            # Shape = [num_columns, recepetive_area, 2]:
+            context = stride_inputs(context, self.downward_mapping)
+            # Shape = [num_columns, receptive_area * 2]:
+            context = rearrange(context, "n r d -> n (d r)")
+
+        return context
+
+    def get_prev_prediction(self, layer: Layer) -> jnp.array:
+        """Get the prediction made by a decoder during its previous activation."""
+        if layer.level == 0:
+            prev_prediction = layer.buffer.nearest("decoder")
+        else:
+            prev_prediction = layer.buffer._all("decoder")
+            # Shape = [num_columns, 2 * column_dim]:
+            prev_prediction = jnp.concatenate(
+                [prev_prediction[1], prev_prediction[2]], axis=-1
+            )
+            prev_prediction = rearrange(prev_prediction, "n (x d) -> n x d", x=2)
+
+        return prev_prediction
+
+    def get_targets(self, layer: Layer, inputs: jnp.array) -> jnp.array:
+        """Build the values a decoder prediction is targeting."""
+        if layer.level == 0:
+            targets = sparse_to_dense(
+                inputs,
+                dim=self.config.preprocessor_dim,
+            )
+        else:
+            targets = sparse_to_dense(
+                self.layers[layer - 1].buffer.nearest("encoder"),
+                dim=self.config.hidden_column_dim,
+            )
+
+        return targets
 
     @classmethod
     def from_pretrained(config):
@@ -341,6 +383,7 @@ class Network:
             dec = Decoder(parameters=dec_params, learning_rate=config.decoder_lr)
             layers.append(
                 Layer(
+                    level=l,
                     decoder=dec,
                     encoder=enc,
                     buffer=buf,

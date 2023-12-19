@@ -1,6 +1,6 @@
 from src.propagate import propagate
 
-from typing import Tuple
+from typing import Optional, Tuple, Union
 
 from jax import nn, vmap
 import jax.numpy as jnp
@@ -60,10 +60,10 @@ class Decoder:
 
     def learn(
         self,
-        target: jnp.array,
-        prediction: jnp.array,
         context: jnp.array,
-    ):
+        prediction: jnp.array,
+        target: jnp.array,
+    ) -> None:
         """Outter learn function."""
         loss, parameters = self._learn(
             target=target,
@@ -77,18 +77,15 @@ class Decoder:
 
         return loss, parameters
 
-    def _step(
+    def __call__(
         self,
         context: jnp.array,
-        parameters: jnp.array,
-    ) -> Tuple[jnp.array]:
-        return self.forward(context, parameters)
-
-    def step(
-        self,
-        context: jnp.array,
-    ) -> Tuple[jnp.array]:
-        return self._step(
-            context=context,
-            parameters=self.parameters,
-        )
+        prediction: Optional[jnp.array] = None,
+        target: Optional[jnp.array] = None,
+    ) -> Union[jnp.array, None]:
+        if target is not None:
+            # Learn mode.
+            self.learn(context=context, prediction=prediction, target=target)
+        else:
+            # Forward mode.
+            return self.forward(input=context, parameters=self.parameters)
