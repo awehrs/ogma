@@ -1,6 +1,6 @@
 from src.propagate import propagate
 
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 from jax import nn, vmap
 import jax.numpy as jnp
@@ -42,7 +42,7 @@ class Decoder:
         previous_context = jnp.expand_dims(previous_context, axis=1)
         return jnp.kron(input_losses, jnp.transpose(previous_context))
 
-    def _learn(
+    def learn(
         self,
         target: jnp.array,
         prediction: jnp.array,
@@ -56,36 +56,25 @@ class Decoder:
 
         parameters += learning_rate * delta
 
-        return loss, parameters
-
-    def learn(
-        self,
-        context: jnp.array,
-        prediction: jnp.array,
-        target: jnp.array,
-    ) -> None:
-        """Outter learn function."""
-        loss, parameters = self._learn(
-            target=target,
-            prediction=prediction,
-            context=context,
-            parameters=self.parameters,
-            learning_rate=self.lr,
-        )
-
-        self.parameters = parameters
-
-        return loss, parameters
+        return parameters, loss
 
     def __call__(
         self,
         context: jnp.array,
         prediction: Optional[jnp.array] = None,
         target: Optional[jnp.array] = None,
-    ) -> Union[jnp.array, None]:
+    ) -> jnp.array:
         if target is not None:
             # Learn mode.
-            self.learn(context=context, prediction=prediction, target=target)
+            parameters, loss = self.learn(
+                context=context,
+                prediction=prediction,
+                target=target,
+                parameters=self.parameters,
+                learning_rate=self.lr,
+            )
+            self.parameters = parameters
+            return loss
         else:
             # Forward mode.
             return self.forward(input=context, parameters=self.parameters)

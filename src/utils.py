@@ -36,13 +36,6 @@ def sparse_to_dense(idx: jnp.array, dim: int):
     return matrix.at[jnp.arange(len(idx)), idx].set(1)
 
 
-def concat_and_stride(
-    arr_1: jnp.array, arr_2: jnp.array, mapping: jnp.array
-) -> jnp.array:
-    """Index align and stride to input arrays"""
-    pass
-
-
 def get_clock_schedule(clock_type: str) -> Callable:
     if clock_type == "exponential":
 

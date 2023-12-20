@@ -60,7 +60,8 @@ class Encoder:
         num_iters: int,
         learning_rate: float,
     ) -> jnp.array:
-        input_col_dim = parameters.shape[1]
+        input_col_dim = int(parameters.shape[-1] / upward_mapping.shape[-1])
+        hidden_col_dim = parameters.shape[1]
 
         activation = jnp.zeros(shape=(downward_mapping.shape[0], parameters.shape[1]))
         recons = jnp.zeros_like(input_activations)
@@ -88,13 +89,18 @@ class Encoder:
 
         hidden = jnp.argmax(activation, axis=1)
 
-        hidden = sparse_to_dense(hidden, dim=input_col_dim)
+        hidden = sparse_to_dense(hidden, dim=hidden_col_dim)
 
         hidden = stride_inputs(hidden, downward_mapping)
 
         hidden = rearrange(hidden, "n r h -> n (r h)")
 
-        delta = vmap(self.update)(loss, hidden)
+        update = vmap(self.update, in_axes=(0, 0, None))
+        delta = update(
+            loss,
+            hidden,
+            upward_mapping.shape[-1],
+        )
 
         parameters += learning_rate * delta
 
@@ -107,6 +113,7 @@ class Encoder:
         self,
         input_losses: jnp.array,
         hidden_column: jnp.array,
+        receptive_area: int,
     ) -> jnp.array:
         """
         Args:
@@ -118,7 +125,17 @@ class Encoder:
         """
         input_losses = jnp.expand_dims(input_losses, axis=1)
         hidden_column = jnp.expand_dims(hidden_column, axis=1)
-        return jnp.kron(input_losses, jnp.transpose(hidden_column))
+        # Shape = (input_col_dim, receptive_area * hidden_dim)
+        # E.g., the shape of transposed parameters used in .backwards()
+        updated_params = jnp.kron(input_losses, jnp.transpose(hidden_column))
+        # Shape = (hidden_dim, hidden_dim, receptive_area * input_col_dim)
+        # E.g., pre-transposed shape of the parameters
+        reshaped_params = rearrange(
+            updated_params,
+            "i (r h) -> h (r i)",
+            r=receptive_area,
+        )
+        return reshaped_params
 
     def step(
         self,
@@ -131,7 +148,7 @@ class Encoder:
         learn: bool = True,
     ) -> Tuple[jnp.array]:
         if learn:
-            parameters = self.learn(
+            self.parameters = self.learn(
                 input_activations,
                 parameters,
                 upward_mapping,
@@ -141,7 +158,7 @@ class Encoder:
             )
         return self.forward(
             input_activiations=stride_inputs(input_activations, upward_mapping),
-            parameters=parameters,
+            parameters=self.parameters,
             input_is_one_hot=True,
             output_is_one_hot=True,
         )
