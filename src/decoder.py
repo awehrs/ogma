@@ -1,7 +1,9 @@
 from src.propagate import propagate
+from src.utils import stride_inputs
 
 from typing import Optional, Tuple
 
+from einops import rearrange
 from jax import nn, vmap
 import jax.numpy as jnp
 
@@ -14,12 +16,13 @@ class Decoder:
         self.lr = learning_rate
         self.optimizer = None
 
-    def activate(self, h: jnp.array) -> jnp.array:
-        """One hot activation."""
-        return jnp.argmax(h, axis=1)
-
-    def forward(self, input: jnp.array, parameters: jnp.array) -> jnp.array:
-        h = propagate(input, parameters, input_is_one_hot=True, output_is_one_hot=False)
+    def forward(self, input: jnp.array, parameters: jnp.array, k_hot: int) -> jnp.array:
+        h = propagate(
+            input,
+            parameters,
+            k_hot_input=k_hot,
+            k_hot_output=None,
+        )
         return nn.softmax(h)
 
     def loss(self, prediction: jnp.array, target: jnp.array):
@@ -38,43 +41,55 @@ class Decoder:
         Returns:
             array of shape (receptive_area, prediction_dim, context_dim)
         """
-        input_losses = jnp.expand_dims(input_losses, axis=1)
+        input_losses = rearrange(input_losses, "r d -> d r")
         previous_context = jnp.expand_dims(previous_context, axis=1)
         return jnp.kron(input_losses, jnp.transpose(previous_context))
 
     def learn(
         self,
-        target: jnp.array,
-        prediction: jnp.array,
         context: jnp.array,
+        prediction: jnp.array,
+        target: jnp.array,
+        downward_mapping: jnp.array,
+        offset: int,
         parameters: jnp.array,
         learning_rate: float,
     ) -> Tuple[jnp.array]:
         loss = self.loss(prediction, target)
 
+        loss = stride_inputs(inputs=loss, input_mapping=downward_mapping)
+
         delta = vmap(self.update)(loss, context)
 
-        parameters += learning_rate * delta
+        parameters.at[:, offset : offset + prediction.shape[1], :].add(
+            learning_rate * delta
+        )
 
-        return parameters, loss
+        return parameters
 
     def __call__(
         self,
         context: jnp.array,
         prediction: Optional[jnp.array] = None,
         target: Optional[jnp.array] = None,
+        downward_mapping: Optional[jnp.array] = None,
+        offset: Optional[int] = None,
+        k_hot: Optional[int] = None,
     ) -> jnp.array:
         if target is not None:
             # Learn mode.
-            parameters, loss = self.learn(
+            parameters = self.learn(
                 context=context,
                 prediction=prediction,
                 target=target,
+                downward_mapping=downward_mapping,
+                offset=offset,
                 parameters=self.parameters,
                 learning_rate=self.lr,
             )
             self.parameters = parameters
-            return loss
+            return prediction, target
         else:
             # Forward mode.
-            return self.forward(input=context, parameters=self.parameters)
+            context = stride_inputs(inputs=context, input_mapping=downward_mapping)
+            return self.forward(input=context, parameters=self.parameters, k_hot=k_hot)

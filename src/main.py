@@ -33,6 +33,8 @@ def sin_wave(
         (y - lower_bound) / (upper_bound - lower_bound) * (col_dim - 1) + 0.5
     ).astype(jnp.int16)
 
+    if len(y_binned.shape) == 1:
+        y_binned = jnp.expand_dims(y_binned, axis=-1)
     return y_binned
 
 
@@ -40,9 +42,7 @@ total_time = 0
 
 DELTA_X = 0.2
 
-for t in tqdm(range(100)):
-    print("Timestep ", t)
-    print("///")
+for t in tqdm(range(1000)):
     value_to_encode = sin_wave(
         idx=0 + t * DELTA_X,
         window_len=config.x_dim,
@@ -59,7 +59,7 @@ print("Average forward pass time:", total_time / 1000)
 # Inference.
 total_time = 0
 
-for t in range(50):
+for t in range(500):
     t1 = time.time()
     network.step(network.get_prediction(), learn=False)
     t2 = time.time()
@@ -68,7 +68,7 @@ for t in range(50):
 
     predicted_index = network.get_prediction()
 
-    print("Predicted index:", predicted_index)
+    print("Predicted index:", predicted_index[0])
 
 print("Average inference pass took:", total_time / 500)
 

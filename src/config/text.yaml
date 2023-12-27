@@ -1,12 +1,13 @@
 num_layers: 5
 hidden_column_dim: 16
 preprocessor_dim: 32
+k_hot: 1
 share_weights: false
 x_dim: 16 # Max sequence length
 y_dim:
 encoder_lr: 0.5
 num_iters: 3
-decoder_lr: 0.5
+decoder_lr: 0.1
 up_radius: 4
 down_radius: 4
 pad: false
@@ -14,4 +15,5 @@ pad_value: "-inf"
 rng_seed: 42
 schedule_type: "exponential"
 temporal_horizon: 4
+loss_fn:
 log_losses: true

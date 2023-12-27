@@ -1,14 +1,14 @@
 from src.actor import Actor
 from src.encoder import Encoder
 from src.decoder import Decoder
-from src.utils import sparse_to_dense, stride_inputs
+from src.utils import dense_to_sparse, sparse_to_dense, stride_inputs
 
 from collections import deque
 from dataclasses import dataclass
 import logging
 from typing import List, Mapping
 
-from einops import rearrange
+from einops import rearrange, repeat
 import jax.numpy as jnp
 from jax import lax, random, vmap
 
@@ -25,6 +25,7 @@ class MemoryBuffer:
 
     def __init__(
         self,
+        k_hot: int,
         decoder_dim: int,
         num_input_columns: int,
         temporal_horizon: int,
@@ -35,7 +36,7 @@ class MemoryBuffer:
 
         enc_buffer = deque(
             [
-                jnp.zeros(shape=(num_input_columns,), dtype="int16")
+                jnp.zeros(shape=(num_input_columns, k_hot), dtype="int16")
                 for _ in range(temporal_horizon)
             ],
             maxlen=temporal_horizon,
@@ -44,39 +45,51 @@ class MemoryBuffer:
         dec_buffer = deque(
             [
                 jnp.zeros(shape=(num_input_columns, decoder_dim), dtype=jnp.float32)
-                for _ in range(num_decoder_predictions + 1)
+                for _ in range(num_decoder_predictions)
             ],
-            maxlen=num_decoder_predictions + 1,
+            maxlen=num_decoder_predictions,
         )
 
         self.buffer = {"encoder": enc_buffer, "decoder": dec_buffer}
 
     def nearest(self, enc_or_dec: str) -> jnp.array:
-        """Get closest activation in time; shape = (num_hidden_columns[, column_dim])"""
+        """Get closest activation in time; shape = (num_hidden_columns, k_hot/column_dim)"""
         if enc_or_dec == "encoder":
             return self.buffer[enc_or_dec][-1]
         else:
             return self.buffer[enc_or_dec][0]
 
     def _all(self, enc_or_dec: str) -> deque[jnp.array]:
-        """Get all activations; shape = (temporal_horizon, num_hidden_columns[, column_dim])"""
+        """Get all activations; shape = (temporal_horizon, num_hidden_columns, k_hot/column_dim])"""
         return self.buffer[enc_or_dec]
 
+    def pop(self, enc_or_dec: str) -> None:
+        if enc_or_dec == "encoder":
+            raise NotImplementedError
+        else:
+            self.buffer["decoder"].popleft()
+
     def push(self, activation: jnp.array, enc_or_dec: str) -> None:
+        assert len(activation.shape) > 1
+
         if enc_or_dec == "encoder":
             self.buffer[enc_or_dec].append(activation)
         else:
             # Add multiple predictions at once.
             self.buffer[enc_or_dec].extend(
-                jnp.split(activation, indices_or_sections=self.num_decoder_predictions)
+                jnp.split(
+                    activation,
+                    indices_or_sections=self.num_decoder_predictions,
+                    axis=-1,
+                )
             )
 
     @property
-    def decoder_buffer(self) -> deque[jnp.array]:
+    def decoder(self) -> deque[jnp.array]:
         return self.buffer["decoder"]
 
     @property
-    def encoder_buffer(self) -> deque[jnp.array]:
+    def encoder(self) -> deque[jnp.array]:
         return self.buffer["encoder"]
 
 
@@ -111,8 +124,6 @@ class Network:
         """Perform upward (decoder-learning, encoder) and downward (decoder) pass."""
 
         # Upward pass.
-        print("Upward pass")
-        print("///")
         for layer in self.layers:
             layer.ticks += 1
 
@@ -120,26 +131,24 @@ class Network:
                 # Layer not ready to fire.
                 continue
 
-            print("Layer:", layer.level)
-
             inputs = self.get_layer_inputs(layer=layer, precepts=precepts)
 
             # Update the weights of this layer's decoder.
             if learn:
-                print("decoder learning")
-                loss = self.decoder_call(layer=layer, inputs=inputs, learn=True)
+                prediction, target = self.decoder_call(
+                    layer=layer, inputs=inputs, learn=True
+                )
 
-                if self.config.log_losses:
-                    logger.info(f"Layer number {layer.level} decoder loss: {loss}")
+            input_col_dim = self.get_input_column_dim(layer.level)
 
             # Encoder pass.
-            print("encoder pass")
-            print("///")
             h_t = layer.encoder(
                 input_activations=inputs,
+                k_hot=self.config.k_hot,
                 learn=learn,
                 upward_mapping=self.upward_mapping,
                 downward_mapping=self.downward_mapping,
+                input_column_dim=input_col_dim,
             )
 
             # Update encoder state.
@@ -148,13 +157,11 @@ class Network:
             layer.buffer.push(h_t, "encoder")
 
         # Downward pass.
-        print("downward pass")
         for layer in reversed(self.layers):
             if not layer.updated:
                 # Layer not ready to activate.
                 continue
 
-            print("layer: ", layer.level)
             y_t = self.decoder_call(layer=layer, inputs=inputs, learn=False)
 
             # Update decoder buffer.
@@ -164,7 +171,7 @@ class Network:
     def decoder_call(self, layer: Layer, inputs: jnp.array, learn: bool) -> None:
         """
         Gather a layer's previous context and, possibly, prediction and targets;
-            and pass them to decoder's learning or forward function.
+            pass them to decoder's learning or forward function.
         """
         # Get most recent output of layer's encoder.
         enc_output = self.get_layer_output(layer=layer, learn=learn)
@@ -177,10 +184,17 @@ class Network:
             layer=layer,
             feedback=feedback,
             enc_output=enc_output,
+            learn=learn,
         )
 
         # Get the previous prediction of this layer's decoder.
         prev_prediction = self.get_prev_prediction(layer) if learn else None
+
+        if learn:
+            offset = layer.buffer.decoder.maxlen - len(layer.buffer.decoder)
+            layer.buffer.pop("decoder")
+        else:
+            offset = None
 
         # Get the target of the prediction.
         targets = self.get_targets(layer=layer, inputs=inputs) if learn else None
@@ -189,93 +203,88 @@ class Network:
             context=context,
             prediction=prev_prediction,
             target=targets,
+            downward_mapping=self.downward_mapping,
+            offset=offset,
+            k_hot=self.config.k_hot,
         )
 
-    def get_offset(self, layer: Layer) -> int:
-        """
-        Convenience method. Determines if layer is firing at the same time as
-            the layer above it (offset = 1) or  in between the activations of
-            the layer above it (offset = 0).
-        """
-        offset = (
-            0
-            if self.layers[layer.level + 1].ticks
-            < self.layers[layer.level + 1].ticks_per_update
-            else 1
-        )
-        return offset
-
-    def get_layer_output(self, layer: Layer, learn: bool) -> jnp.array:
-        """Get layer's most recent encoder ouput."""
-        enc_output = layer.buffer.nearest("encoder")
-
-        if learn:
-            enc_output = sparse_to_dense(enc_output, dim=self.config.hidden_column_dim)
-
-        return enc_output
+    def get_input_column_dim(self, layer_num: int) -> int:
+        if layer_num == 0:
+            return self.config.preprocessor_dim
+        else:
+            return self.config.hidden_column_dim * self.config.temporal_horizon
 
     def get_layer_inputs(self, layer: Layer, precepts: jnp.array) -> jnp.array:
-        """Get the feedforward inputs to a given layer."""
+        """
+        Get the feedforward inputs to a given layer.
+
+        Returns arry of shape (num_columns, temporal_horizon, k_hot).
+        """
         if layer.level == 0:
             # Bottom layer has no history.
             inputs = precepts
         else:
             # Every other layer pulls from a memory buffer.
             inputs = self.layers[layer.level - 1].buffer._all("encoder")
-            inputs = jnp.concatenate(inputs, axis=0)
+            inputs = jnp.concatenate(inputs, axis=-1)
+            inputs = self.adjust_dimensions(
+                inputs,
+                column_dimension=self.config.hidden_column_dim,
+                k_hot=self.config.k_hot,
+            )
 
         return inputs
 
+    def get_layer_output(self, layer: Layer, learn: bool) -> jnp.array:
+        """Get layer's most recent encoder ouput."""
+        enc_output = layer.buffer.nearest("encoder")
+
+        if learn:
+            enc_output = sparse_to_dense(
+                enc_output, dim=self.config.hidden_column_dim, k_hot=self.config.k_hot
+            )
+
+        return enc_output
+
     def get_feedback(self, layer: Layer, learn: bool) -> jnp.array:
         """Get the feedback from next layer's decoder."""
-        if layer.level == len(self.layers):
+        if layer.level == len(self.layers) - 1:
             # Top layer receives no feedback.
             feedback = None
         else:
-            offset = self.get_offset(layer)
-            feedback = self.layers[layer.level + 1].buffer._all("decoder")[offset]
+            feedback = self.layers[layer.level + 1].buffer.nearest("decoder")
             if not learn:
-                feedback = layer.decoder.activate(feedback)
+                feedback = dense_to_sparse(feedback, k_hot=self.config.k_hot)
 
         return feedback
 
     def build_decoder_context(
-        self, layer: Layer, feedback: jnp.array, enc_output: jnp.array
+        self, layer: Layer, feedback: jnp.array, enc_output: jnp.array, learn: bool
     ) -> jnp.array:
         """
         Combine (same layer) encoder output with decoder feeback, to create
             context for decoder to consume.
         """
-        if layer.level == len(self.layers):
-            # Shape = [num_columns, receptive_area]
-            context = stride_inputs(enc_output, self.downward_mapping)
+        if layer.level == len(self.layers) - 1:
+            # shape = [num_columns, k_hot/hidden_dim]
+            context = enc_output
         else:
-            if len(feedback.shape) == 2:  # Dense inputs.
-                # Shape = [num_columns, 2]:
-                context = jnp.concatenate([feedback, enc_output], axis=-1)
-            else:  # Sparse inputs
-                # Shape = [num_columns, 2]:
-                context = jnp.stack([feedback, enc_output], axis=1)
-            # Shape = [num_columns, recepetive_area, 2]:
-            context = stride_inputs(context, self.downward_mapping)
-            # Shape = [num_columns, receptive_area * 2]:
-            context = rearrange(context, "n r d -> n (d r)")
+            # Shape = [num_columns, 2 * k_hot/hidden_column_dimension]:
+            context = jnp.concatenate([feedback, enc_output], axis=-1)
+
+            if not learn:
+                context = self.adjust_dimensions(
+                    context,
+                    column_dimension=self.config.hidden_column_dim,
+                    k_hot=self.config.k_hot,
+                )
 
         return context
 
     def get_prev_prediction(self, layer: Layer) -> jnp.array:
         """Get the prediction made by a decoder during its previous activation."""
-        if layer.level == 0:
-            prev_prediction = layer.buffer.nearest("decoder")
-        else:
-            prev_prediction = layer.buffer._all("decoder")
-            # Shape = [num_columns, 2 * column_dim]:
-            prev_prediction = jnp.concatenate(
-                [prev_prediction[1], prev_prediction[2]], axis=-1
-            )
-            prev_prediction = rearrange(prev_prediction, "n (x d) -> n x d", x=2)
 
-        return prev_prediction
+        return layer.buffer.nearest("decoder")
 
     def get_targets(self, layer: Layer, inputs: jnp.array) -> jnp.array:
         """Build the values a decoder prediction is targeting."""
@@ -283,11 +292,13 @@ class Network:
             targets = sparse_to_dense(
                 inputs,
                 dim=self.config.preprocessor_dim,
+                k_hot=self.config.k_hot,
             )
         else:
             targets = sparse_to_dense(
                 self.layers[layer.level - 1].buffer.nearest("encoder"),
                 dim=self.config.hidden_column_dim,
+                k_hot=self.config.k_hot,
             )
 
         return targets
@@ -296,7 +307,7 @@ class Network:
         """Get prediction of next input."""
         layer = self.layers[0]
         dense_pred = layer.buffer.nearest("decoder")
-        sparse_pred = layer.decoder.activate(dense_pred)
+        sparse_pred = dense_to_sparse(dense_pred, k_hot=self.config.k_hot)
 
         return sparse_pred
 
@@ -473,7 +484,6 @@ class Network:
         cls, key: random.PRNGKey, layer_num: int, config: Mapping
     ) -> jnp.array:
         num_columns = cls.num_columns(config)
-        output_dim = config.hidden_column_dim
         receptive_area_down = cls.receptive_area(config, direction="down")
         num_decoder_predictions = cls.num_decoder_predictions(
             layer_num, schedule_type=config.schedule_type
@@ -508,11 +518,29 @@ class Network:
         num_preds = cls.num_decoder_predictions(layer_num, config.schedule_type)
 
         return MemoryBuffer(
+            k_hot=config.k_hot,
             decoder_dim=decoder_dim,
             num_input_columns=cls.num_columns(config),
             temporal_horizon=config.temporal_horizon,
             num_decoder_predictions=num_preds,
         )
+
+    @staticmethod
+    def adjust_dimensions(
+        columns: jnp.array, column_dimension: int, k_hot: int
+    ) -> jnp.array:
+        """
+        Args:
+            columns: activation array of shape (num_hidden_columns, k_hot * num_vecs)
+            column_dimension: dense dimension of vectors that were concatenated to form 'columns'
+            k_hot: number of active cells per vector that got concatenated
+        """
+        num_vecs = columns.shape[-1] // k_hot
+        offset = jnp.arange(
+            start=0, stop=num_vecs * column_dimension, step=column_dimension
+        )
+        offset = repeat(offset, "d -> (d k)", k=k_hot)
+        return columns + offset
 
     @staticmethod
     def num_columns(config: Mapping) -> int:
