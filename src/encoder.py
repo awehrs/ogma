@@ -1,29 +1,54 @@
 from src.utils import dense_to_sparse, sparse_to_dense, stride_inputs
 from src.propagate import propagate
 
+from abc import ABC, abstractmethod
+from functools import partial
 from typing import Tuple, Optional
 
 from einops import rearrange
-from jax import vmap
+from jax import vmap, jit
 import jax.numpy as jnp
 
 
-class Encoder:
+class Encoder(ABC):
+    """Abstract base class for stateless encoder."""
+
+    @abstractmethod
+    def forward():
+        pass
+
+    @abstractmethod
+    def backward():
+        pass
+
+    @abstractmethod
+    def learn():
+        pass
+
+    @abstractmethod
+    def update():
+        pass
+
+
+class ReconstructionEncoder(Encoder):
     """Exponential Reconstruction Encoder."""
 
-    def __init__(self, parameters: jnp.array, num_iters: int, learning_rate: int):
-        self.parameters = parameters
-        self.num_iters = num_iters
-        self.lr = learning_rate
-        self.optimizer = None
-
     def forward(
-        self,
         input_activations: jnp.array,
         parameters: jnp.array,
         k_hot_input: int,
         k_hot_output: int,
     ) -> jnp.array:
+        """
+        Args:
+            input_activations: array of shape = (num_columns, k_hot_input)
+            parameters: array of shape =
+                (num_columns, hidden_column_dim, receptive_area * input_dim)
+            k_hot_input: number of active indices per input column.
+            k_hot_output: number of active indices per output column.
+        Returns:
+            array of shape (num_columns, k_hot_output)
+        """
         return propagate(
             input_activations,
             parameters,
@@ -32,13 +57,23 @@ class Encoder:
         )
 
     def backward(
-        self,
         output_activations: jnp.array,
         parameters: jnp.array,
         downward_mapping: jnp.array,
         k_hot_input: int,
         k_hot_output: int,
     ) -> jnp.array:
+        """
+        Args:
+            output_activations: array of shape (num_columns, k_hot_input)
+            parameters: array of shape =
+                (num_columns, hidden_column_dim, receptive_area * input_dim)
+            downward_mapping: array of shape (num_columns, receptive_area, k_hot_input)
+            k_hot_input: number of active indices per input column.
+            k_hot_output: number of active indices per output column.
+        Returns:
+            array of shape (num_columns, input_dim)
+        """
         output_activations = stride_inputs(output_activations, downward_mapping)
         parameters = rearrange(
             parameters, "n h (r i) -> n i (r h)", r=output_activations.shape[1]
@@ -53,7 +88,6 @@ class Encoder:
         return jnp.exp(jnp.minimum(recons - 1, jnp.zeros_like(recons)))
 
     def learn(
-        self,
         input_activations: jnp.array,
         parameters: jnp.array,
         upward_mapping: jnp.array,
@@ -62,10 +96,13 @@ class Encoder:
         k_hot: int,
         learning_rate: float,
         input_column_dim: int,
-    ) -> jnp.array:
+    ) -> Tuple[jnp.array]:
         """
         Args:
-            input_activations: tensor of shape (num_hidden_columns, receptive_area, k_hot)
+            input_activations: array of shape (num_columns, receptive_area, k_hot)
+        Returns:
+            parameters: array of shape (num_columns, output_dim, receptive_area * input_dim)
+            reconstruction: array of shape (num_columns, input_column_dim)
         """
         hidden_col_dim = parameters.shape[1]
 
@@ -94,7 +131,7 @@ class Encoder:
             else:
                 inputs = stride_inputs(input_activations - recons, upward_mapping)
 
-            output += self.forward(
+            output += ReconstructionEncoder.forward(
                 inputs,
                 parameters,
                 k_hot_input=k_hot if i < 1 else None,
@@ -103,7 +140,7 @@ class Encoder:
 
             activation = dense_to_sparse(output, k_hot)
 
-            recons = self.backward(
+            recons = ReconstructionEncoder.backward(
                 activation,
                 parameters,
                 downward_mapping,
@@ -111,7 +148,7 @@ class Encoder:
                 k_hot_output=None,
             )
 
-        loss = self.loss(input_activations, recons)
+        loss = ReconstructionEncoder.loss(input_activations, recons)
 
         hidden = jnp.argmax(activation, axis=1)
 
@@ -121,7 +158,7 @@ class Encoder:
 
         hidden = rearrange(hidden, "n r h -> n (r h)")
 
-        update = vmap(self.update, in_axes=(0, 0, None))
+        update = vmap(ReconstructionEncoder.update, in_axes=(0, 0, None))
 
         delta = update(
             loss,
@@ -131,13 +168,17 @@ class Encoder:
 
         parameters += learning_rate * delta
 
-        return parameters
+        return parameters, recons
 
-    def loss(self, inputs: jnp.array, reconstruction: jnp.array) -> jnp.array:
+    def loss(inputs: jnp.array, reconstruction: jnp.array) -> jnp.array:
+        """
+        Args:
+            inputs: array of shape (num_columns, input_dim)
+            reconstruction: array of shape (num_columns, input_dim)
+        """
         return inputs - reconstruction
 
     def update(
-        self,
         input_losses: jnp.array,
         hidden_column: jnp.array,
         receptive_area: int,
@@ -146,7 +187,7 @@ class Encoder:
         Args:
             input_losses: array of shape (input_dim)
             hidden_column: array of shape (hidden_dim * receptive_area,)
-
+            receptive_area: number of input columns to which output column is connected.
         Returns:
             array of shape (receptive_area, hidden_dim, input_dim)
         """
@@ -164,20 +205,46 @@ class Encoder:
         )
         return reshaped_params
 
+    @staticmethod
+    @partial(
+        jit,
+        static_argnames=[
+            "k_hot",
+            "learn",
+            "input_column_dim",
+            "learning_rate",
+            "num_iters",
+        ],
+    )
     def step(
-        self,
         input_activations: jnp.array,
         parameters: jnp.array,
         upward_mapping: jnp.array,
         downward_mapping: jnp.array,
-        num_iters: int,
         k_hot: int,
-        learning_rate: float,
-        input_column_dim: int,
-        learn: bool = True,
-    ) -> Tuple[jnp.array]:
+        learn: bool,
+        input_column_dim: Optional[int] = None,
+        learning_rate: Optional[float] = None,
+        num_iters: Optional[int] = None,
+    ) -> Tuple[Optional[jnp.array]]:
+        """
+        Args:
+            input_activations: array of shape (num_columns, k_hot)
+            parameters: array of shape (num_columns, output_dim, receptive_area * output_dim)
+            upward_mapping: array of shape (num_columns, receptive_area, k_hot)
+            downward_mapping: array of shape (num_columns, receptive_area, k_hot)
+            k_hot: number of active cells per column.
+            learn: whether to perform reconstruction learning.
+            input_column_dim: dense dimension of inputs.
+            learning_rate: factor by which to update weights.
+            num_iters: number of reconstruction loops to perform.
+        Returns:
+            parameters: updated parameters, or NoneType if learn == False.
+            output: array of shape (num_columns, k_hot).
+            reconstruction: array of shape (num_columns, input_column_dim).
+        """
         if learn:
-            self.parameters = self.learn(
+            parameters, reconstruction = ReconstructionEncoder.learn(
                 input_activations=input_activations,
                 parameters=parameters,
                 upward_mapping=upward_mapping,
@@ -187,35 +254,14 @@ class Encoder:
                 learning_rate=learning_rate,
                 input_column_dim=input_column_dim,
             )
-        return self.forward(
+        else:
+            reconstruction = None
+
+        output = ReconstructionEncoder.forward(
             input_activations=stride_inputs(input_activations, upward_mapping),
-            parameters=self.parameters,
+            parameters=parameters,
             k_hot_input=k_hot,
             k_hot_output=k_hot,
         )
 
-    def __call__(
-        self,
-        *,
-        input_activations: jnp.array,
-        k_hot: int,
-        learn: bool,
-        upward_mapping: jnp.array,
-        downward_mapping: jnp.array,
-        input_column_dim: Optional[int] = None,
-    ):
-        if len(input_activations.shape) > 1:
-            # vmap/pmap step over batch dimension
-            pass
-
-        return self.step(
-            input_activations=input_activations,
-            parameters=self.parameters,
-            upward_mapping=upward_mapping,
-            downward_mapping=downward_mapping,
-            num_iters=self.num_iters,
-            k_hot=k_hot,
-            learning_rate=self.lr,
-            input_column_dim=input_column_dim,
-            learn=learn,
-        )
+        return parameters, output, reconstruction

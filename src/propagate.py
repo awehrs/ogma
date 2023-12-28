@@ -3,7 +3,7 @@ from src.utils import dense_to_sparse
 from functools import partial
 from typing import Optional
 
-from einops import rearrange, repeat
+from einops import rearrange
 import jax.numpy as jnp
 from jax import jit, vmap
 
@@ -41,7 +41,7 @@ def propagate(
     return output
 
 
-@partial(jit, static_argnums=(1, 2))
+@partial(jit, static_argnames=["k_hot"])
 def sparse_matmul(
     parameters: jnp.array,
     input_activations: jnp.array,

@@ -3,7 +3,6 @@ from src.network import Network
 from pathlib import Path
 import time
 
-from jax import random
 import jax.numpy as jnp
 from omegaconf import OmegaConf
 from tqdm import tqdm
@@ -12,6 +11,7 @@ config = OmegaConf.load(Path("src", "config") / "text.yaml")
 
 # Build network.
 network = Network.init_random(config)
+
 
 print("Number of network parameters:", network.num_params)
 
@@ -40,7 +40,7 @@ def sin_wave(
 
 total_time = 0
 
-DELTA_X = 0.2
+DELTA_X = 0.02
 
 for t in tqdm(range(1000)):
     value_to_encode = sin_wave(
@@ -59,7 +59,7 @@ print("Average forward pass time:", total_time / 1000)
 # Inference.
 total_time = 0
 
-for t in range(500):
+for t in tqdm(range(500)):
     t1 = time.time()
     network.step(network.get_prediction(), learn=False)
     t2 = time.time()
@@ -68,7 +68,7 @@ for t in range(500):
 
     predicted_index = network.get_prediction()
 
-    print("Predicted index:", predicted_index[0])
+    # print("Predicted index:", predicted_index[0])
 
 print("Average inference pass took:", total_time / 500)
 

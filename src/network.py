@@ -1,12 +1,12 @@
 from src.actor import Actor
-from src.encoder import Encoder
-from src.decoder import Decoder
-from src.utils import dense_to_sparse, sparse_to_dense, stride_inputs
+from src.encoder import Encoder, ReconstructionEncoder
+from src.decoder import Decoder, LinearDecoder
+from src.utils import dense_to_sparse, sparse_to_dense
 
 from collections import deque
 from dataclasses import dataclass
 import logging
-from typing import List, Mapping
+from typing import Callable, List, Mapping, Tuple
 
 from einops import rearrange, repeat
 import jax.numpy as jnp
@@ -17,7 +17,7 @@ logger = logging.getLogger()
 
 class MemoryBuffer:
     """
-    Stores encoder activations (one hot) and decoder predictions (dense).
+    Stores encoder activations (k-hot) and decoder predictions (dense).
 
     Encoder L to R order: oldest activations -> newest activations.
     Decoder L to R order: nearest predictions -> most distant predictions.
@@ -97,8 +97,10 @@ class MemoryBuffer:
 class Layer:
     level: int
     temporal_horizon: int
-    decoder: Decoder
-    encoder: Encoder
+    decoder_params: jnp.array
+    encoder_params: jnp.array
+    decoder_losses: List[float]
+    encoder_losses: List[float]
     buffer: MemoryBuffer
     ticks_per_update: int
     ticks: int = 0
@@ -112,6 +114,8 @@ class Network:
         self,
         layers: List[Layer],
         config: Mapping,
+        decoder: Decoder,
+        encoder: Encoder,
         upward_mapping: jnp.array,
         downward_mapping: jnp.array,
     ):
@@ -119,6 +123,14 @@ class Network:
         self.config = config
         self.upward_mapping = upward_mapping
         self.downward_mapping = downward_mapping
+
+        self.decoder_loss_fn = self.build_loss_fn(config.loss_fn)
+        self.encoder_loss_fn = self.build_loss_fn(config.loss_fn)
+        self.decoder_forward_fn = self.build_decoder_forward_fn(
+            decoder, config.async_step
+        )
+        self.decoder_learn_fn = self.build_decoder_learn_fn(decoder, config.async_step)
+        self.encoder_step_fn = self.build_encoder_step_fn(encoder, config.async_step)
 
     def step(self, precepts: jnp.array, learn: bool = True, act: bool = False):
         """Perform upward (decoder-learning, encoder) and downward (decoder) pass."""
@@ -135,26 +147,42 @@ class Network:
 
             # Update the weights of this layer's decoder.
             if learn:
-                prediction, target = self.decoder_call(
-                    layer=layer, inputs=inputs, learn=True
+                context = self.build_decoder_context(layer=layer, learn=learn)
+                offset, prediction, target = self.build_decoder_example(
+                    layer=layer, inputs=inputs
+                )
+                layer.decoder_params = self.decoder_learn_fn(
+                    context=context,
+                    prediction=prediction,
+                    target=target,
+                    downward_mapping=self.downward_mapping,
+                    parameters=layer.decoder_params,
+                    offset=offset,
+                    learning_rate=self.config.decoder_lr,
                 )
 
+            # Encoder pass.
             input_col_dim = self.get_input_column_dim(layer.level)
 
-            # Encoder pass.
-            h_t = layer.encoder(
+            parameters, output, reconstruction = self.encoder_step_fn(
                 input_activations=inputs,
-                k_hot=self.config.k_hot,
-                learn=learn,
+                parameters=layer.encoder_params,
                 upward_mapping=self.upward_mapping,
                 downward_mapping=self.downward_mapping,
+                k_hot=self.config.k_hot,
+                learn=learn,
                 input_column_dim=input_col_dim,
+                learning_rate=self.config.encoder_lr,
+                num_iters=self.config.num_iters,
             )
 
             # Update encoder state.
+            if learn:
+                layer.encoder_params = parameters
+
             layer.ticks = 0
             layer.updated = True
-            layer.buffer.push(h_t, "encoder")
+            layer.buffer.push(output, "encoder")
 
         # Downward pass.
         for layer in reversed(self.layers):
@@ -162,16 +190,66 @@ class Network:
                 # Layer not ready to activate.
                 continue
 
-            y_t = self.decoder_call(layer=layer, inputs=inputs, learn=False)
+            context = self.build_decoder_context(layer=layer, learn=False)
+
+            y_t = self.decoder_forward_fn(
+                context=context,
+                parameters=layer.decoder_params,
+                downward_mapping=self.downward_mapping,
+                k_hot=self.config.k_hot,
+            )
 
             # Update decoder buffer.
             layer.buffer.push(y_t, "decoder")
             layer.updated = False
 
-    def decoder_call(self, layer: Layer, inputs: jnp.array, learn: bool) -> None:
+    def naive_async_step(self, precepts: jnp.array, learn: bool):
+        layers = jnp.arange(start=0, stop=self.config.num_layers)
+        inputs = [
+            self.get_layer_inputs(precepts=precepts, layer=l) for l in self.layers
+        ]
+        context = [
+            self.build_decoder_context(layer=l, learn=False) for l in self.layers
+        ]
+        example = [
+            self.build_decoder_example(layer=l, inputs=i)
+            for (i, l) in zip(inputs, self.layers)
+        ]
+        import time
+
+        f = vmap(
+            lambda ctxt: self.layers[1].decoder.forward(
+                ctxt,
+                self.layers[1].decoder_params,
+                self.downward_mapping,
+                self.config.k_hot,
+            )
+        )
+        f(jnp.stack(context[:-1]))
+        t1 = time.time()
+        f(jnp.stack(context[:-1]))
+        t2 = time.time()
+
+        print(t2 - t1)
+        assert False
+        params = vmap(lambda layer, input: "layer.decoder.forward(input)")(
+            "layers", inputs
+        )
+        for l in self.layers:
+            l.decoder_params = params[l.layer]
+
+        params, output, recons = vmap(lambda layer, input: "layer.encoder.step(input)")(
+            "layers", inputs
+        )
+        inputs = "async gather_decoder_forward_inputs(layers)"
+        prediction = vmap(lambda layer, inputs: "layer.decoder.forward(input)")(
+            "layers", inputs
+        )
+
+    def build_decoder_context(self, layer: Layer, learn: bool) -> jnp.array:
         """
-        Gather a layer's previous context and, possibly, prediction and targets;
-            pass them to decoder's learning or forward function.
+        Combine (same layer) encoder output with decoder feeback, to create
+            context for decoder to consume.
         """
         # Get most recent output of layer's encoder.
         enc_output = self.get_layer_output(layer=layer, learn=learn)
@@ -179,34 +257,38 @@ class Network:
         # Get feedback from next layer's decoder.
         feedback = self.get_feedback(layer=layer, learn=learn)
 
-        # Build context the decoder conditioned its previous prediction on.
-        context = self.build_decoder_context(
-            layer=layer,
-            feedback=feedback,
-            enc_output=enc_output,
-            learn=learn,
-        )
-
-        # Get the previous prediction of this layer's decoder.
-        prev_prediction = self.get_prev_prediction(layer) if learn else None
-
-        if learn:
-            offset = layer.buffer.decoder.maxlen - len(layer.buffer.decoder)
-            layer.buffer.pop("decoder")
+        if layer.level == len(self.layers) - 1:
+            # shape = [num_columns, k_hot/hidden_dim]
+            context = enc_output
         else:
-            offset = None
+            # Shape = [num_columns, 2 * k_hot/hidden_column_dimension]:
+            context = jnp.concatenate([feedback, enc_output], axis=-1)
+            if not learn:
+                context = self.adjust_dimensions(
+                    context,
+                    column_dimension=self.config.hidden_column_dim,
+                    k_hot=self.config.k_hot,
+                )
+
+        return context
+
+    def build_decoder_example(
+        self, layer: Layer, inputs: jnp.array
+    ) -> Tuple[jnp.array]:
+        """
+        Arrange (target, prediction) example for decoder learning.
+        """
+        # Get the previous prediction of this layer's decoder.
+        prev_prediction = self.get_prev_prediction(layer)
+
+        # Get offset index for parameter updating.
+        offset = layer.buffer.decoder.maxlen - len(layer.buffer.decoder)
+        layer.buffer.pop("decoder")
 
         # Get the target of the prediction.
-        targets = self.get_targets(layer=layer, inputs=inputs) if learn else None
+        targets = self.get_targets(layer=layer, inputs=inputs)
 
-        return layer.decoder(
-            context=context,
-            prediction=prev_prediction,
-            target=targets,
-            downward_mapping=self.downward_mapping,
-            offset=offset,
-            k_hot=self.config.k_hot,
-        )
+        return offset, prev_prediction, targets
 
     def get_input_column_dim(self, layer_num: int) -> int:
         if layer_num == 0:
@@ -258,29 +340,6 @@ class Network:
 
         return feedback
 
-    def build_decoder_context(
-        self, layer: Layer, feedback: jnp.array, enc_output: jnp.array, learn: bool
-    ) -> jnp.array:
-        """
-        Combine (same layer) encoder output with decoder feeback, to create
-            context for decoder to consume.
-        """
-        if layer.level == len(self.layers) - 1:
-            # shape = [num_columns, k_hot/hidden_dim]
-            context = enc_output
-        else:
-            # Shape = [num_columns, 2 * k_hot/hidden_column_dimension]:
-            context = jnp.concatenate([feedback, enc_output], axis=-1)
-
-            if not learn:
-                context = self.adjust_dimensions(
-                    context,
-                    column_dimension=self.config.hidden_column_dim,
-                    k_hot=self.config.k_hot,
-                )
-
-        return context
-
     def get_prev_prediction(self, layer: Layer) -> jnp.array:
         """Get the prediction made by a decoder during its previous activation."""
 
@@ -317,6 +376,9 @@ class Network:
 
     @classmethod
     def init_random(cls, config):
+        if config.async_step:
+            assert config.hidden_column_dim == config.preprocessor_dim
+
         key = random.PRNGKey(config.rng_seed)
         layers = []
         # Build connections between layers.
@@ -340,20 +402,20 @@ class Network:
                 radius=config.down_radius,
                 pad=config.pad,
             )
+
+        # Build encoders/decoders.
+        decoder = cls.init_decoder(config.decoder_type)
+        encoder = cls.init_encoder(config.encoder_type)
+
         # Build layers.
         for l in range(config.num_layers):
             # Build encoder.
             key, subkey = random.split(key)
             enc_params = cls.init_encoder_params(layer_num=l, key=subkey, config=config)
-            enc = Encoder(
-                parameters=enc_params,
-                num_iters=config.num_iters,
-                learning_rate=config.encoder_lr,
-            )
+
             # Build decoder.
             key, subkey = random.split(key)
             dec_params = cls.init_decoder_params(layer_num=l, key=subkey, config=config)
-            dec = Decoder(parameters=dec_params, learning_rate=config.decoder_lr)
 
             # Build memory buffer.
             buf = cls.init_memory_buffer(layer_num=l, config=config)
@@ -362,8 +424,10 @@ class Network:
             layers.append(
                 Layer(
                     level=l,
-                    decoder=dec,
-                    encoder=enc,
+                    decoder_params=dec_params,
+                    encoder_params=enc_params,
+                    decoder_losses=[],
+                    encoder_losses=[],
                     buffer=buf,
                     temporal_horizon=config.temporal_horizon if l != 0 else 1,
                     ticks=0,
@@ -371,9 +435,16 @@ class Network:
                 )
             )
 
+        # Adjust parameters to allow for layerwise parallelism.
+        if config.async_step:
+            layers = cls.pad_encoder_params(layers)
+            layers = cls.pad_decoder_params(layers)
+
         return cls(
             layers=layers,
             config=config,
+            decoder=decoder,
+            encoder=encoder,
             upward_mapping=up_mapping,
             downward_mapping=down_mapping,
         )
@@ -488,7 +559,6 @@ class Network:
         num_decoder_predictions = cls.num_decoder_predictions(
             layer_num, schedule_type=config.schedule_type
         )
-
         if layer_num == 0:
             # Feedback and enc_output get concat'ed, hence the 2.
             input_dim = 2 * receptive_area_down * config.hidden_column_dim
@@ -524,6 +594,53 @@ class Network:
             temporal_horizon=config.temporal_horizon,
             num_decoder_predictions=num_preds,
         )
+
+    @staticmethod
+    def pad_encoder_params(layers: List[Layer]) -> List[Layer]:
+        standard_dim = layers[-1].encoder_params.shape[-1]
+        bottom_layer_dim = layers[0].encoder_params.shape[-1]
+
+        layers[0].encoder_params = jnp.pad(
+            layers[0].encoder_params,
+            pad_width=((0, 0), (0, 0), (0, standard_dim - bottom_layer_dim)),
+            constant_values=0,
+        )
+
+        assert all(
+            layer.encoder_params.shape == layers[0].encoder_params.shape
+            for layer in layers
+        )
+
+        return layers
+
+    @staticmethod
+    def pad_decoder_params(layers: List[Layer]) -> List[Layer]:
+        standard_output_dim = layers[-1].decoder_params.shape[1]
+        standard_input_dim = layers[0].decoder_params.shape[-1]
+        bottom_layer_output_dim = layers[0].decoder_params.shape[1]
+        top_layer_input_dim = layers[-1].decoder_params.shape[-1]
+
+        layers[0].decoder_params = jnp.pad(
+            layers[0].decoder_params,
+            pad_width=(
+                (0, 0),
+                (0, standard_output_dim - bottom_layer_output_dim),
+                (0, 0),
+            ),
+            constant_values=0,
+        )
+
+        layers[-1].decoder_params = jnp.pad(
+            layers[-1].decoder_params,
+            pad_width=(
+                (0, 0),
+                (0, 0),
+                (0, standard_input_dim - top_layer_input_dim),
+            ),
+            constant_values=0,
+        )
+
+        return layers
 
     @staticmethod
     def adjust_dimensions(
@@ -569,10 +686,99 @@ class Network:
         else:
             raise NotImplementedError
 
+    @staticmethod
+    def init_encoder(encoder_type: str) -> Encoder:
+        if encoder_type == "reconstruction":
+            return ReconstructionEncoder()
+        else:
+            raise NotImplementedError
+
+    @staticmethod
+    def init_decoder(decoder_type: str) -> Decoder:
+        if decoder_type == "linear":
+            return LinearDecoder()
+        else:
+            raise NotImplementedError
+
+    @staticmethod
+    def build_decoder_forward_fn(decoder: Decoder, async_step: bool):
+        if not async_step:
+            return decoder.forward
+
+        if isinstance(decoder, LinearDecoder):
+            forward_fn = vmap(
+                lambda context, parameters, downward_mapping, k_hot: decoder.forward(
+                    context, parameters, downward_mapping, k_hot
+                ),
+                in_axes=(0, 0, None, None),
+            )
+        else:
+            raise NotImplementedError
+
+        return forward_fn
+
+    @staticmethod
+    def build_decoder_learn_fn(decoder: Decoder, async_step: bool):
+        if not async_step:
+            return decoder.learn
+
+        if isinstance(decoder, LinearDecoder):
+            learn_fn = vmap(
+                lambda context, prediction, target, downward_mapping, parameters, offset, learning_rate: decoder.learn(
+                    context,
+                    prediction,
+                    target,
+                    parameters,
+                    offset,
+                    downward_mapping,
+                    learning_rate,
+                ),
+                in_axes=(0, 0, 0, 0, 0, None, None),
+            )
+        else:
+            raise NotImplementedError
+
+        return learn_fn
+
+    @staticmethod
+    def build_encoder_step_fn(encoder: Encoder, async_step: bool):
+        if not async_step:
+            return encoder.step
+
+        if isinstance(encoder, ReconstructionEncoder):
+            learn_fn = vmap(
+                lambda input_activations, parameters, upward_mapping, downward_mapping, k_hot, learn, input_column_dim, learning_rate, num_iters: encoder.step(
+                    input_activations,
+                    parameters,
+                    upward_mapping,
+                    downward_mapping,
+                    k_hot,
+                    learn,
+                    input_column_dim,
+                    learning_rate,
+                    num_iters,
+                ),
+                in_axes=(0, 0, None, None, None, None, None, None, None),
+            )
+        else:
+            raise NotImplementedError
+
+        return learn_fn
+
+    @staticmethod
+    def build_loss_fn(loss_fn: str) -> Callable:
+        pass
+
     @property
     def num_params(self) -> int:
         params = 0
         for layer in self.layers:
-            params += layer.encoder.parameters.size
-            params += layer.decoder.parameters.size
+            params += layer.encoder_params.size
+            params += layer.decoder_params.size
+
+        # TODO
+        if self.config.async_step:
+            # Subtract dummy parameters.
+            pass
+
         return params

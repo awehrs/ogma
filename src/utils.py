@@ -1,7 +1,6 @@
 from functools import partial
-from typing import Callable
 
-from einops import repeat, rearrange
+
 import jax
 import jax.numpy as jnp
 from jax import jit, lax, vmap
@@ -49,14 +48,3 @@ def dense_to_sparse(arr: jnp.array, k_hot: int) -> jnp.array:
         return jnp.expand_dims(jnp.argmax(arr, axis=1), axis=-1).astype(jnp.int16)
     else:
         return lax.top_k(arr, k=k_hot)[1].astype(jnp.int16)
-
-
-def get_clock_schedule(clock_type: str) -> Callable:
-    if clock_type == "exponential":
-
-        def schedule(layer: int):
-            return 2**layer
-
-        return schedule
-    else:
-        raise NotImplementedError
