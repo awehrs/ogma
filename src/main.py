@@ -12,7 +12,6 @@ config = OmegaConf.load(Path("src", "config") / "text.yaml")
 # Build network.
 network = Network.init_random(config)
 
-
 print("Number of network parameters:", network.num_params)
 
 # Learning.

@@ -2,7 +2,7 @@ num_layers: 5
 hidden_column_dim: 16
 preprocessor_dim: 16
 k_hot: 1
-async_step: false
+async_step: true
 encoder_type: "reconstruction"
 decoder_type: "linear"
 share_weights: false

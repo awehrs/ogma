@@ -6,7 +6,7 @@ from src.utils import dense_to_sparse, sparse_to_dense
 from collections import deque
 from dataclasses import dataclass
 import logging
-from typing import Callable, List, Mapping, Tuple
+from typing import Callable, List, Mapping, Optional, Tuple
 
 from einops import rearrange, repeat
 import jax.numpy as jnp
@@ -99,6 +99,8 @@ class Layer:
     temporal_horizon: int
     decoder_params: jnp.array
     encoder_params: jnp.array
+    decoder_padding: Mapping[int, int]
+    encoder_padding: Mapping[int, int]
     decoder_losses: List[float]
     encoder_losses: List[float]
     buffer: MemoryBuffer
@@ -133,118 +135,196 @@ class Network:
         self.encoder_step_fn = self.build_encoder_step_fn(encoder, config.async_step)
 
     def step(self, precepts: jnp.array, learn: bool = True, act: bool = False):
+        if self.config.async_step:
+            self.async_step(precepts, learn)
+        else:
+            for layer in self.layers:
+                self.step_layer_up(layer, precepts, learn)
+            for layer in reversed(self.layers):
+                self.step_layer_down(layer)
+
+    def step_layer_up(
+        self, layer: Layer, precepts: jnp.array, learn: bool = True, act: bool = False
+    ) -> None:
         """Perform upward (decoder-learning, encoder) and downward (decoder) pass."""
 
         # Upward pass.
+        layer.ticks += 1
+
+        if layer.ticks < layer.ticks_per_update:
+            # Layer not ready to fire.
+            return
+
+        inputs = self.get_layer_inputs(layer=layer, precepts=precepts)
+
+        # Update the weights of this layer's decoder.
+        if learn:
+            context = self.build_decoder_context(layer=layer, learn=learn)
+            offset, prediction, target = self.build_decoder_example(
+                layer=layer, inputs=inputs
+            )
+            dec_params = layer.decoder_params = self.decoder_learn_fn(
+                context=context,
+                prediction=prediction,
+                target=target,
+                downward_mapping=self.downward_mapping,
+                parameters=layer.decoder_params,
+                offset=offset,
+                learning_rate=self.config.decoder_lr,
+            )
+        else:
+            dec_params = offset = prediction = target = None
+
+        # Encoder pass.
+        input_col_dim = self.get_input_column_dim(layer.level)
+
+        enc_params, enc_output, reconstruction = self.encoder_step_fn(
+            input_activations=inputs,
+            parameters=layer.encoder_params,
+            upward_mapping=self.upward_mapping,
+            downward_mapping=self.downward_mapping,
+            k_hot=self.config.k_hot,
+            learn=learn,
+            input_column_dim=input_col_dim,
+            learning_rate=self.config.encoder_lr,
+            num_iters=self.config.num_iters,
+        )
+
+        self.update_layer_state(
+            layer,
+            learn=learn,
+            up_or_down="up",
+            async_step=False,
+            decoder_params=dec_params,
+            encoder_params=enc_params,
+            encoder_output=enc_output,
+            input_reconstruction=reconstruction,
+            target=target,
+            prediction=prediction,
+        )
+
+    def step_layer_down(self, layer: Layer) -> None:
+        # Downward pass.
+        if not layer.updated:
+            # Layer not ready to activate.
+            return
+
+        context = self.build_decoder_context(layer=layer, learn=False)
+
+        dec_output = self.decoder_forward_fn(
+            context=context,
+            parameters=layer.decoder_params,
+            downward_mapping=self.downward_mapping,
+            k_hot=self.config.k_hot,
+        )
+
+        self.update_layer_state(
+            layer,
+            learn=False,
+            up_or_down="down",
+            async_step=False,
+            decoder_output=dec_output,
+        )
+
+    def async_step(self, precepts: jnp.array, learn: bool):
+        """
+        Step all ready-to-fire layers in parallel.
+        """
+        # Determine which layers are firing.
+        active_layers = []
         for layer in self.layers:
             layer.ticks += 1
+            if layer.ticks >= layer.ticks_per_update:
+                active_layers.append(layer)
 
-            if layer.ticks < layer.ticks_per_update:
-                # Layer not ready to fire.
-                continue
+        # Gather params.
+        enc_params = jnp.concatenate([layer.encoder_params for layer in active_layers])
+        dec_params = jnp.concatenate([layer.decoder_params for layer in active_layers])
 
-            inputs = self.get_layer_inputs(layer=layer, precepts=precepts)
+        # Gather inputs.
+        layer_inputs = [
+            self.get_layer_inputs(layer, precepts) for layer in active_layers
+        ]
+        inputs_array = jnp.concatenate(layer_inputs)
 
-            # Update the weights of this layer's decoder.
-            if learn:
-                context = self.build_decoder_context(layer=layer, learn=learn)
-                offset, prediction, target = self.build_decoder_example(
-                    layer=layer, inputs=inputs
-                )
-                layer.decoder_params = self.decoder_learn_fn(
-                    context=context,
-                    prediction=prediction,
-                    target=target,
-                    downward_mapping=self.downward_mapping,
-                    parameters=layer.decoder_params,
-                    offset=offset,
-                    learning_rate=self.config.decoder_lr,
-                )
+        # Do decoder learning.
+        if learn:
+            # Gather decoder inputs.
+            layer_context = [
+                self.build_decoder_context(layer, learn) for layer in active_layers
+            ]
+            context_array = jnp.stack(layer_context)
+            layer_example = [
+                self.build_decoder_example(active_layers[i], layer_inputs[i])
+                for i in range(len(active_layers))
+            ]
+            offset_array = jnp.stack([example[0] for example in layer_example])
+            prediction_array = jnp.stack([example[1] for example in layer_example])
+            target_array = jnp.stack([example[2] for example in layer_example])
 
-            # Encoder pass.
-            input_col_dim = self.get_input_column_dim(layer.level)
-
-            parameters, output, reconstruction = self.encoder_step_fn(
-                input_activations=inputs,
-                parameters=layer.encoder_params,
-                upward_mapping=self.upward_mapping,
-                downward_mapping=self.downward_mapping,
-                k_hot=self.config.k_hot,
-                learn=learn,
-                input_column_dim=input_col_dim,
-                learning_rate=self.config.encoder_lr,
-                num_iters=self.config.num_iters,
+            # Layer parallel forword.
+            assert False
+            dec_params = self.decoder_learn_fn(
+                context_array,
+                prediction_array,
+                target_array,
+                offset_array,
+                self.downward_mapping,
+                self.config.decoder_lr,
             )
 
-            # Update encoder state.
-            if learn:
-                layer.encoder_params = parameters
+        # Do encoder step
+        enc_params, enc_output, reconstruction = self.encoder_step_fn(
+            inputs_array, learn
+        )
 
+        # update_layer_state(up)
+        for layer in active_layers:
+            self.update_layer_state(layer, parameters=enc_params)
+
+        # Gather inputs again.
+        layer_context = [
+            self.build_decoder_context(layer, learn=False) for layer in active_layers
+        ]
+        context_array = jnp.stack(layer_context)
+
+        # Decoder foward.
+        dec_output = None
+
+    def update_layer_state(
+        self,
+        layer: Layer,
+        learn: bool,
+        up_or_down: str,
+        async_step: bool = False,
+        decoder_params: Optional[jnp.array] = None,
+        encoder_params: Optional[jnp.array] = None,
+        decoder_output: Optional[jnp.array] = None,
+        encoder_output: Optional[jnp.array] = None,
+        input_reconstruction: Optional[jnp.array] = None,
+        target: Optional[jnp.array] = None,
+        prediction: Optional[jnp.array] = None,
+    ) -> None:
+        # Update after upward pass.
+        if up_or_down == "up":
+            if learn:
+                layer.decoder_params = decoder_params
+                layer.encoder_params = encoder_params
+                # layer.decoder_losses.append(
+                #     self.decoder_loss_fn(target, prediction)
+                # )
+                # layer.encoder_losses.append(
+                #     self.encoder_loss_fn(
+                #         encoder_output, input_reconstruction
+                #     )
+                # )
             layer.ticks = 0
             layer.updated = True
-            layer.buffer.push(output, "encoder")
-
-        # Downward pass.
-        for layer in reversed(self.layers):
-            if not layer.updated:
-                # Layer not ready to activate.
-                continue
-
-            context = self.build_decoder_context(layer=layer, learn=False)
-
-            y_t = self.decoder_forward_fn(
-                context=context,
-                parameters=layer.decoder_params,
-                downward_mapping=self.downward_mapping,
-                k_hot=self.config.k_hot,
-            )
-
-            # Update decoder buffer.
-            layer.buffer.push(y_t, "decoder")
-            layer.updated = False
-
-    def naive_async_step(self, precepts: jnp.array, learn: bool):
-        layers = jnp.arange(start=0, stop=self.config.num_layers)
-        inputs = [
-            self.get_layer_inputs(precepts=precepts, layer=l) for l in self.layers
-        ]
-        context = [
-            self.build_decoder_context(layer=l, learn=False) for l in self.layers
-        ]
-        example = [
-            self.build_decoder_example(layer=l, inputs=i)
-            for (i, l) in zip(inputs, self.layers)
-        ]
-        import time
-
-        f = vmap(
-            lambda ctxt: self.layers[1].decoder.forward(
-                ctxt,
-                self.layers[1].decoder_params,
-                self.downward_mapping,
-                self.config.k_hot,
-            )
-        )
-        f(jnp.stack(context[:-1]))
-        t1 = time.time()
-        f(jnp.stack(context[:-1]))
-        t2 = time.time()
-
-        print(t2 - t1)
-        assert False
-        params = vmap(lambda layer, input: "layer.decoder.forward(input)")(
-            "layers", inputs
-        )
-        for l in self.layers:
-            l.decoder_params = params[l.layer]
-
-        params, output, recons = vmap(lambda layer, input: "layer.encoder.step(input)")(
-            "layers", inputs
-        )
-        inputs = "async gather_decoder_forward_inputs(layers)"
-        prediction = vmap(lambda layer, inputs: "layer.decoder.forward(input)")(
-            "layers", inputs
-        )
+            layer.buffer.push(encoder_output, "encoder")
+        # Update after downward pass
+        else:
+            layer.udpated = False
+            layer.buffer.push(decoder_output, "decoder")
 
     def build_decoder_context(self, layer: Layer, learn: bool) -> jnp.array:
         """
@@ -300,6 +380,9 @@ class Network:
         """
         Get the feedforward inputs to a given layer.
 
+        Args:
+            precepts: array of shape (k_hot,)
+
         Returns arry of shape (num_columns, temporal_horizon, k_hot).
         """
         if layer.level == 0:
@@ -332,11 +415,15 @@ class Network:
         """Get the feedback from next layer's decoder."""
         if layer.level == len(self.layers) - 1:
             # Top layer receives no feedback.
-            feedback = None
+            if self.config.async_step:
+                feedback = jnp.zeros(shape=(self.config.hidden_col_dim))
+            else:
+                return None
         else:
             feedback = self.layers[layer.level + 1].buffer.nearest("decoder")
-            if not learn:
-                feedback = dense_to_sparse(feedback, k_hot=self.config.k_hot)
+
+        if not learn:
+            feedback = dense_to_sparse(feedback, k_hot=self.config.k_hot)
 
         return feedback
 
@@ -347,7 +434,7 @@ class Network:
 
     def get_targets(self, layer: Layer, inputs: jnp.array) -> jnp.array:
         """Build the values a decoder prediction is targeting."""
-        if layer.level == 0:
+        if layer.level == 0 and not self.config.async_step:
             targets = sparse_to_dense(
                 inputs,
                 dim=self.config.preprocessor_dim,
@@ -369,6 +456,11 @@ class Network:
         sparse_pred = dense_to_sparse(dense_pred, k_hot=self.config.k_hot)
 
         return sparse_pred
+
+    def num_padded_steps(self, layer: Layer, up_or_down: str) -> int:
+        return layer.encoder_padding[2] // (
+            self.config.hidden_column_dim * self.receptive_area(self.config, up_or_down)
+        )
 
     @classmethod
     def from_pretrained(config):
@@ -426,6 +518,8 @@ class Network:
                     level=l,
                     decoder_params=dec_params,
                     encoder_params=enc_params,
+                    decoder_padding={},
+                    encoder_padding={},
                     decoder_losses=[],
                     encoder_losses=[],
                     buffer=buf,
@@ -582,10 +676,14 @@ class Network:
 
     @classmethod
     def init_memory_buffer(cls, layer_num: int, config: Mapping) -> MemoryBuffer:
-        decoder_dim = (
-            config.preprocessor_dim if layer_num == 0 else config.hidden_column_dim
-        )
-        num_preds = cls.num_decoder_predictions(layer_num, config.schedule_type)
+        if config.async_step:
+            # Enforce layer I/O unformity through buffer uniformity.
+            pass
+        else:
+            decoder_dim = (
+                config.preprocessor_dim if layer_num == 0 else config.hidden_column_dim
+            )
+            num_preds = cls.num_decoder_predictions(layer_num, config.schedule_type)
 
         return MemoryBuffer(
             k_hot=config.k_hot,
@@ -600,11 +698,15 @@ class Network:
         standard_dim = layers[-1].encoder_params.shape[-1]
         bottom_layer_dim = layers[0].encoder_params.shape[-1]
 
+        last_dim_pad = standard_dim - bottom_layer_dim
+
         layers[0].encoder_params = jnp.pad(
             layers[0].encoder_params,
-            pad_width=((0, 0), (0, 0), (0, standard_dim - bottom_layer_dim)),
+            pad_width=((0, 0), (0, 0), (0, last_dim_pad)),
             constant_values=0,
         )
+
+        layers[0].encoder_padding[2] = last_dim_pad
 
         assert all(
             layer.encoder_params.shape == layers[0].encoder_params.shape
@@ -620,15 +722,21 @@ class Network:
         bottom_layer_output_dim = layers[0].decoder_params.shape[1]
         top_layer_input_dim = layers[-1].decoder_params.shape[-1]
 
+        # Adjust for first layer's fewer predictions.
+        output_dim_pad = standard_output_dim - bottom_layer_output_dim
+
         layers[0].decoder_params = jnp.pad(
             layers[0].decoder_params,
             pad_width=(
                 (0, 0),
-                (0, standard_output_dim - bottom_layer_output_dim),
+                (0, output_dim_pad),
                 (0, 0),
             ),
             constant_values=0,
         )
+        layers[0].decoder_padding[1] = output_dim_pad
+
+        # Adjust for last layer's lack of feedback.
 
         layers[-1].decoder_params = jnp.pad(
             layers[-1].decoder_params,
