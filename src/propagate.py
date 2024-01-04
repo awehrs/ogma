@@ -69,6 +69,6 @@ def sparse_matmul(
     idx = input_activations + offset
     idx = rearrange(idx, "r k -> (r k)")
 
-    unsummed = jnp.take(parameters, idx, axis=-1)
+    unsummed = jnp.take(parameters, idx, axis=-1, mode="fill", fill_value=0)
 
     return jnp.sum(unsummed, axis=1)

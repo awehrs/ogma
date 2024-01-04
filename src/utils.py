@@ -31,7 +31,7 @@ def stride_inputs(
 def sparse_to_dense(idx: jnp.array, dim: int, k_hot: int) -> jnp.array:
     """
     Construct dense vector from the activation index. Only called on
-        unconcatenated activations.
+        activations that have had dimensions adjusted.
 
     Args:
         idx: array of shape (num_hidden_columns, k_hot)
@@ -39,7 +39,7 @@ def sparse_to_dense(idx: jnp.array, dim: int, k_hot: int) -> jnp.array:
     matrix = jnp.zeros(shape=(len(idx), dim), dtype="int16")
     row_idx = jnp.expand_dims(jnp.arange(len(idx)), axis=1)
 
-    return matrix.at[row_idx, idx].set(1)
+    return matrix.at[row_idx, idx].set(1, mode="drop")
 
 
 def dense_to_sparse(arr: jnp.array, k_hot: int) -> jnp.array:

@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from functools import partial
 
 from einops import rearrange
-from jax import nn, jit, vmap
+from jax import lax, nn, jit, vmap
 import jax.numpy as jnp
 
 
@@ -80,6 +80,7 @@ class LinearDecoder(Decoder):
         offset: int,
         downward_mapping: jnp.array,
         learning_rate: float,
+        is_async: bool = False,
     ) -> jnp.array:
         """
         Args:
@@ -102,9 +103,12 @@ class LinearDecoder(Decoder):
 
         delta = vmap(LinearDecoder.update)(loss, context)
 
-        parameters.at[:, offset : offset + prediction.shape[1], :].add(
-            learning_rate * delta
-        )
+        if isinstance(offset, jnp.ndarray):
+            parameters.at[:, offset, :].add(learning_rate * delta)
+        else:
+            parameters.at[:, offset : offset + prediction.shape[1], :].add(
+                learning_rate * delta
+            )
 
         return parameters
 
