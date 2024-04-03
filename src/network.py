@@ -601,9 +601,11 @@ class Network:
                     decoder_losses=[],
                     encoder_losses=[],
                     buffer=buf,
-                    temporal_horizon=config.temporal_horizon
-                    if (l != 0) or (config.async_step)
-                    else 1,
+                    temporal_horizon=(
+                        config.temporal_horizon
+                        if (l != 0) or (config.async_step)
+                        else 1
+                    ),
                     ticks=0,
                     ticks_per_update=2**l,  # Exponential memory.
                 )
